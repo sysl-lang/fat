@@ -1,0 +1,175 @@
+module sh.sysl.fat
+
+// What a boot sector says about where everything on the volume is, checked against the spec and against
+// the device it was read from.
+
+// The three FAT types. The spec decides the type by the count of data clusters and by nothing else
+// (section 3.5): the label in the boot sector is informational. The package reads and writes FAT16 and
+// FAT32; a FAT12 volume is recognised and refused.
+enum FatType derives Display
+    Fat12
+    Fat16
+    Fat32
+
+// Fewer clusters than this is FAT12; fewer than `FAT32_MIN_CLUSTERS` is FAT16; the rest are FAT32.
+val FAT16_MIN_CLUSTERS: u32 = 4085
+val FAT32_MIN_CLUSTERS: u32 = 65525
+
+// The most data clusters a FAT32 volume may have: cluster numbers past 0x0FFF_FFF6 are reserved.
+val FAT32_MAX_CLUSTERS: u32 = 0x0FFF_FFF5
+
+// The type a volume of `clusters` data clusters is (spec section 3.5).
+fat_type_of(clusters: u32) -> FatType =
+    if clusters < FAT16_MIN_CLUSTERS then FatType.Fat12
+    else if clusters < FAT32_MIN_CLUSTERS then FatType.Fat16
+    else FatType.Fat32
+
+// Why a boot sector was refused.
+enum BootError derives Eq, Display
+    Device(error: DeviceError)
+    NoSignature
+    BadJump
+    BadSectorSize
+    SectorSizeMismatch
+    BadClusterSize
+    NoReservedSectors
+    NoFats
+    BadRootEntries
+    NoSectors
+    PastDeviceEnd
+    NoFatSize
+    NoDataRegion
+    BadMedia
+    TypeMismatch
+    FatTooSmall
+    BadVersion
+    BadRootCluster
+    Fat12
+
+impl From[DeviceError] for BootError
+    from(e: DeviceError) -> BootError = BootError.Device(e)
+
+// Every number the rest of the package needs about a volume, in sectors and clusters.
+struct Geometry derives Eq, Display
+    fat_type: FatType
+    bytes_per_sector: u32
+    sectors_per_cluster: u32
+    reserved_sectors: u32
+    fat_count: u32
+    fat_sectors: u32
+    root_entries: u32
+    root_dir_sectors: u32
+    total_sectors: u32
+    first_data_sector: u32
+    clusters: u32
+    root_cluster: u32
+    fs_info_sector: u32
+    backup_boot_sector: u32
+    hidden_sectors: u32
+    media: u8
+    volume_id: u32
+    label: [11]u8
+
+    // The first sector of FAT copy `n`.
+    fat_start(self, n: u32) -> u32 = self.reserved_sectors + n * self.fat_sectors
+
+    // The first sector of FAT16's fixed root directory.
+    root_dir_start(self) -> u32 = self.reserved_sectors + self.fat_count * self.fat_sectors
+
+    // The first sector of data cluster `c`; clusters are numbered from 2.
+    cluster_start(self, c: u32) -> u32 = self.first_data_sector + (c - 2) * self.sectors_per_cluster
+
+    // The bytes in one cluster.
+    cluster_bytes(self) -> u32 = self.bytes_per_sector * self.sectors_per_cluster
+
+    // The highest valid cluster number.
+    last_cluster(self) -> u32 = self.clusters + 1
+end Geometry
+
+private is_power_of_two(n: u32) -> bool = n != 0 && n & (n - 1) == 0
+
+// Read the boot sector of `dev` and check it. `scratch` is one sector of the device's size.
+read_geometry[D: BlockDevice](dev: *D, scratch: []u8) -> Result[Geometry, BootError]
+    dev.read(0, scratch)?
+    parse_boot_sector(scratch, dev.sector_size(), dev.sectors())
+
+// Check a boot sector read from a device of `device_sectors` sectors of `sector_size` bytes, and answer
+// the volume's geometry. Every check is one the spec states; the order is the order the numbers are
+// derived in, so the error names the first field that is wrong.
+parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Result[Geometry, BootError]
+    if sector.len < 512 then return Err(BootError.BadSectorSize)
+    if sector[SIGNATURE_OFFSET] != SIGNATURE[0] || sector[SIGNATURE_OFFSET + 1] != SIGNATURE[1]
+        return Err(BootError.NoSignature)
+    val b: *BootSector = at(sector, 0)
+    val jump = b.jump
+    if !(jump[0] == 0xEB && jump[2] == 0x90) && jump[0] != 0xE9 then return Err(BootError.BadJump)
+
+    val bps = u32(b.bytes_per_sector)
+    if bps != 512 && bps != 1024 && bps != 2048 && bps != 4096 then return Err(BootError.BadSectorSize)
+    if bps != u32(sector_size) then return Err(BootError.SectorSizeMismatch)
+    val spc = u32(b.sectors_per_cluster)
+    if !is_power_of_two(spc) || spc * bps > 32768 then return Err(BootError.BadClusterSize)
+    val reserved = u32(b.reserved_sectors)
+    if reserved == 0 then return Err(BootError.NoReservedSectors)
+    val fats = u32(b.fat_count)
+    if fats == 0 then return Err(BootError.NoFats)
+    val root_entries = u32(b.root_entries)
+    if root_entries * 32 % bps != 0 then return Err(BootError.BadRootEntries)
+    val media = b.media
+    if media != 0xF0 && media < 0xF8 then return Err(BootError.BadMedia)
+
+    val total = if b.total_sectors16 != 0 then u32(b.total_sectors16) else b.total_sectors32
+    if total == 0 then return Err(BootError.NoSectors)
+    if u64(total) > device_sectors then return Err(BootError.PastDeviceEnd)
+
+    val t32: *Fat32Tail = at(sector, TAIL_OFFSET)
+    val fat_sectors = if b.fat_size16 != 0 then u32(b.fat_size16) else t32.fat_size32
+    if fat_sectors == 0 then return Err(BootError.NoFatSize)
+
+    val root_dir_sectors = (root_entries * 32 + bps - 1) / bps
+    val meta = u64(reserved) + u64(fats) * u64(fat_sectors) + u64(root_dir_sectors)
+    if meta >= u64(total) then return Err(BootError.NoDataRegion)
+    val first_data = u32(meta)
+    val clusters = (total - first_data) / spc
+
+    // The spec decides the type by the cluster count alone. Reading, the layout decides between FAT32
+    // and the others instead, as Linux does: a volume with no 16-bit FAT size is FAT32 whatever its
+    // count, so the small FAT32 volumes mtools and `mkfs.fat -F 32` will make (with a warning) still
+    // read. The layout says unambiguously where everything is; `format` never makes such a volume.
+    val kind = if b.fat_size16 == 0 then FatType.Fat32 else fat_type_of(clusters)
+    if kind == FatType.Fat12 then return Err(BootError.Fat12)
+    // FAT32 has no fixed root directory; FAT16 needs one, and its 16-bit entries cannot number FAT32's
+    // count of clusters.
+    val laid_out_right = if kind == FatType.Fat32 then b.fat_size16 == 0 && root_entries == 0 && clusters <= FAT32_MAX_CLUSTERS
+                         else root_entries != 0 && clusters < FAT32_MIN_CLUSTERS
+    if !laid_out_right then return Err(BootError.TypeMismatch)
+
+    // Every cluster, plus the two reserved entries, has its entry inside one FAT.
+    val entry_bytes = if kind == FatType.Fat32 then 4u64 else 2u64
+    if u64(fat_sectors) * u64(bps) < (u64(clusters) + 2) * entry_bytes then return Err(BootError.FatTooSmall)
+
+    var root_cluster = 0u32
+    var fs_info = 0u32
+    var backup = 0u32
+    var volume_id = 0u32
+    var label: [11]u8 = [0; 11]
+    if kind == FatType.Fat32
+        if t32.version != 0 then return Err(BootError.BadVersion)
+        root_cluster = t32.root_cluster
+        if root_cluster < 2 || root_cluster > clusters + 1 then return Err(BootError.BadRootCluster)
+        // A sector number outside the reserved area means there is none (Linux, dosfstools and Windows
+        // all mount such a volume, and the FSInfo is only ever a hint).
+        fs_info = if u32(t32.fs_info) < reserved then u32(t32.fs_info) else 0
+        backup = if u32(t32.backup_boot) < reserved then u32(t32.backup_boot) else 0
+        if t32.boot_signature == EXTENDED_BOOT_SIGNATURE
+            volume_id = t32.volume_id
+            label = t32.label
+    else
+        val t16: *Fat16Tail = at(sector, TAIL_OFFSET)
+        if t16.boot_signature == EXTENDED_BOOT_SIGNATURE
+            volume_id = t16.volume_id
+            label = t16.label
+
+    Ok(Geometry(kind, bps, spc, reserved, fats, fat_sectors, root_entries, root_dir_sectors, total,
+                first_data, clusters, root_cluster, fs_info, backup, b.hidden_sectors, media, volume_id,
+                label))

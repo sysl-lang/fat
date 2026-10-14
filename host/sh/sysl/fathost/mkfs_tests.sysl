@@ -1,0 +1,97 @@
+module sh.sysl.fathost
+@tests
+@requires(os)
+
+import sh.sysl.fat.{FatType, Geometry, read_geometry}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+private geometry_of(image: string, sector_size: usize = 512) -> Geometry
+    var dev = open_image(image, sector_size).unwrap()
+    var scratch: Buf[u8] = buf()
+    for _ in 0..<sector_size
+        scratch.push(0)
+    val g = read_geometry(&dev, scratch.view()).unwrap()
+    dev.close()
+    g
+
+private made(args: []string) -> string = run_mkfs(args, 0x5EED_0001) match
+    Ok(text) -> text
+    Err(why) -> panic(f"mkfs.fat refused: $why")
+
+private refused(args: []string) -> string = run_mkfs(args, 0) match
+    Ok(text) -> panic(f"mkfs.fat accepted what it should refuse: $text")
+    Err(why) -> why
+
+private fsck_clean(image: string)
+    val r = capture("/opt/homebrew/sbin/fsck.fat", ["-n", image], stderr = true).unwrap()
+    if !r.status.ok() then panic(f"fsck.fat: ${r.text}")
+
+@test("left to choose, mkfs.fat makes FAT16 at 512 MiB and FAT32 one KiB past it, and says which")
+type_follows_size()
+    val dir = make_temp_dir("mkfs-fat-").unwrap()
+    val a = f"$dir/a.img"
+    assert_eq(made(["-C", a, "524288"]), f"mkfs.fat: $a: FAT16, 1048576 sectors of 512 bytes, 65501 clusters of 8192 bytes")
+    assert_eq(geometry_of(a).fat_type, FatType.Fat16)
+    assert_eq(geometry_of(a).cluster_bytes(), 8192)
+    fsck_clean(a)
+    val b = f"$dir/b.img"
+    assert(made(["-C", b, "524289"]).contains(": FAT32, 1048578 sectors of 512 bytes"))
+    assert_eq(geometry_of(b).fat_type, FatType.Fat32)
+    assert_eq(geometry_of(b).cluster_bytes(), 4096)
+    fsck_clean(b)
+    remove_dir_all(dir).unwrap()
+
+@test("-F, -s, -S, -n and -i are each honoured, and the volume is clean")
+options_honoured()
+    val dir = make_temp_dir("mkfs-fat-").unwrap()
+    val image = f"$dir/o.img"
+    made(["-F", "32", "-s", "2", "-n", "camera", "-i", "1234ABCD", "-C", image, "102400"])
+    val g = geometry_of(image)
+    assert_eq(g.fat_type, FatType.Fat32)
+    assert_eq(g.sectors_per_cluster, 2)
+    assert_eq(g.volume_id, 0x1234_ABCD)
+    assert_eq(g.label[0], u8('C'))
+    fsck_clean(image)
+    val big = f"$dir/s.img"
+    made(["-S", "4096", "-C", big, "102400"])
+    assert_eq(geometry_of(big, 4096).bytes_per_sector, 4096)
+    remove_dir_all(dir).unwrap()
+
+@test("without -C an existing image is formatted at its own size, with the clock's volume ID")
+formats_existing_image()
+    val dir = make_temp_dir("mkfs-fat-").unwrap()
+    val image = f"$dir/e.img"
+    var blank = create_image(image, 40960).unwrap()
+    blank.close()
+    made([image])
+    val g = geometry_of(image)
+    assert_eq(g.total_sectors, 40960)
+    assert_eq(g.volume_id, 0x5EED_0001)
+    fsck_clean(image)
+    remove_dir_all(dir).unwrap()
+
+@test("every bad command line is refused with the reason, and a refused size leaves an existing file alone")
+refusals()
+    assert(refused([]).starts_with("usage:"))
+    assert(refused(["-F", "12", "x.img"]).contains("16 or 32"))
+    assert(refused(["-q", "x.img"]).contains("unknown option '-q'"))
+    assert(refused(["-s", "two", "x.img"]).contains("not a number"))
+    assert(refused(["-s"]).contains("-s needs a value"))
+    assert(refused(["-S", "768", "x.img"]).contains("sector size"))
+    assert(refused(["-s", "256", "x.img"]).contains("cluster size"))
+    assert(refused(["-n", "a.b", "-C", "x.img", "10240"]).contains("label"))
+    assert(refused(["-C", "x.img"]).contains("size in KiB"))
+    assert(refused(["x.img", "10240"]).contains("only with -C"))
+    assert(refused(["a.img", "1", "2"]).contains("too many"))
+    val dir = make_temp_dir("mkfs-fat-").unwrap()
+    val keep = f"$dir/keep.img"
+    write_text(keep, "precious").unwrap()
+    assert(refused(["-C", keep, "4000"]).contains("too small"))
+    assert(refused(["-F", "32", "-C", keep, "20000"]).contains("too small"))
+    assert(refused(["-F", "16", "-C", keep, "3000000"]).contains("too large"))
+    assert_eq(read_text(keep).unwrap(), "precious")
+    assert(refused([f"$dir/missing.img"]).contains("cannot open"))
+    remove_dir_all(dir).unwrap()

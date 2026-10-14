@@ -1,0 +1,12 @@
+// The FAT package on the host: a block device over an image file, and the tests that check the
+// package's volumes against the host's own FAT tools (macOS's newfs_msdos and fsck_msdos, dosfstools'
+// mkfs.fat and fsck.fat).
+
+package {
+  name    = "fathost"
+  version = "0.0.1"
+}
+
+dependencies {
+  fat { workspace = true }
+}

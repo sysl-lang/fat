@@ -1,0 +1,15 @@
+// Formats a volume over a device in static memory and reads it back: the whole package, instantiated
+// with no operating system underneath.
+
+import device.StaticDevice
+import sh.sysl.fat.{FatType, format, read_geometry}
+
+@export("main")
+probe() -> i32
+    var dev = StaticDevice(20000)
+    val made = format(&dev, Some(FatType.Fat16), label = "PROBE")
+    if made.is_err() then return 1
+    var scratch: [512]u8 = [0; 512]
+    read_geometry(&dev, scratch[..]) match
+        Ok(g) -> i32(g.clusters & 0xFF)
+        Err(_) -> 2

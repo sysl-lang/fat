@@ -1,0 +1,218 @@
+module sh.sysl.fat
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+private sector_of(dev: *RamDevice, s: u64) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for _ in 0..<dev.sector_size()
+        out.push(0)
+    dev.read(s, out.view()).unwrap()
+    out
+
+private formatted(dev: *RamDevice, kind: Option[FatType] = None) -> Geometry = format(dev, kind, label = "SYSL FAT", volume_id = 0x1234_5678) match
+    Ok(g) -> g
+    Err(e) -> panic(f"format refused: $e")
+
+private read_back(dev: *RamDevice) -> Result[Geometry, BootError]
+    var scratch = sector_of(dev, 0)
+    read_geometry(dev, scratch.view())
+
+private entry16(s: []u8, i: usize) -> u16 = u16(s[2 * i]) | u16(s[2 * i + 1]) << 8
+
+private entry32(s: []u8, i: usize) -> u32 = u32(entry16(s, 2 * i)) | u32(entry16(s, 2 * i + 1)) << 16
+
+@test("a formatted FAT16 volume reads back as the geometry format answered, label and volume ID included")
+fat16_round_trip()
+    var dev = ram_device(20000)
+    val g = formatted(&dev)
+    assert_eq(g.fat_type, FatType.Fat16)
+    assert_eq(read_back(&dev).unwrap(), g)
+    assert_eq(g.volume_id, 0x1234_5678)
+    assert_eq(g.label[0], u8('S'))
+    assert_eq(g.label[8], u8(' '))
+    val boot = sector_of(&dev, 0)
+    assert_eq(boot.view()[510], 0x55)
+    assert_eq(boot.view()[511], 0xAA)
+    // A volume under 65,536 sectors keeps its size in the 16-bit field and leaves the 32-bit one zero.
+    val b: *BootSector = at(boot.view(), 0)
+    assert_eq(b.total_sectors16, 20000)
+    assert_eq(b.total_sectors32, 0)
+
+@test("FAT16's first FAT entries hold the media byte and a clean end of chain, in both copies, and the rest is free")
+fat16_tables()
+    var dev = ram_device(20000)
+    val g = formatted(&dev)
+    for n in 0..<g.fat_count
+        val first = sector_of(&dev, u64(g.fat_start(n)))
+        assert_eq(entry16(first.view(), 0), 0xFFF8)
+        assert_eq(entry16(first.view(), 1), 0xFFFF)
+        for i in 2usize..<256
+            assert_eq(entry16(first.view(), i), 0)
+        for s in 1..<g.fat_sectors
+            val rest = sector_of(&dev, u64(g.fat_start(n) + s))
+            for k in 0..<rest.len()
+                assert_eq(rest.view()[k], 0)
+    // The root directory holds the label's entry and nothing else.
+    val first = sector_of(&dev, u64(g.root_dir_start()))
+    val e: *DirEntry = at(first.view(), 0)
+    assert_eq(e.name, g.label)
+    assert_eq(e.attributes, ATTR_VOLUME_ID)
+    for k in 32usize..<first.len()
+        assert_eq(first.view()[k], 0)
+    for s in 1..<g.root_dir_sectors
+        val root = sector_of(&dev, u64(g.root_dir_start() + s))
+        for k in 0..<root.len()
+            assert_eq(root.view()[k], 0)
+
+@test("a volume left as NO NAME keeps its label in the boot sector only, and its root directory is empty")
+no_label_no_entry()
+    var dev = ram_device(20000)
+    val g = format(&dev).unwrap()
+    assert_eq(g.label, volume_label("NO NAME").unwrap())
+    val first = sector_of(&dev, u64(g.root_dir_start()))
+    for k in 0..<first.len()
+        assert_eq(first.view()[k], 0)
+
+@test("a FAT32 volume has its FSInfo, a backup boot sector and FSInfo, and the root directory's one-cluster chain")
+fat32_round_trip()
+    var dev = ram_device(70000)
+    val g = formatted(&dev, Some(FatType.Fat32))
+    assert_eq(g.fat_type, FatType.Fat32)
+    assert_eq(read_back(&dev).unwrap(), g)
+    assert_eq(g.root_cluster, 2)
+    assert_eq(g.fs_info_sector, 1)
+    assert_eq(g.backup_boot_sector, 6)
+    assert_eq(sector_of(&dev, 6).view(), sector_of(&dev, 0).view())
+    assert_eq(sector_of(&dev, 7).view(), sector_of(&dev, 1).view())
+    val info = sector_of(&dev, 1)
+    val f: *FsInfo = at(info.view(), 0)
+    assert_eq(f.lead_signature, 0x4161_5252)
+    assert_eq(f.struct_signature, 0x6141_7272)
+    assert_eq(f.trail_signature, 0xAA55_0000)
+    assert_eq(f.free_count, g.clusters - 1)
+    assert_eq(f.next_free, 3)
+    for n in 0..<g.fat_count
+        val first = sector_of(&dev, u64(g.fat_start(n)))
+        assert_eq(entry32(first.view(), 0), 0x0FFF_FFF8)
+        assert_eq(entry32(first.view(), 1), 0x0FFF_FFFF)
+        assert_eq(entry32(first.view(), 2), 0x0FFF_FFFF)
+        assert_eq(entry32(first.view(), 3), 0)
+    val root = sector_of(&dev, u64(g.cluster_start(2)))
+    val e: *DirEntry = at(root.view(), 0)
+    assert_eq(e.attributes, ATTR_VOLUME_ID)
+    for k in 32usize..<root.len()
+        assert_eq(root.view()[k], 0)
+    // FAT32 keeps no 16-bit sizes and no fixed root directory.
+    val b: *BootSector = at(sector_of(&dev, 0).view(), 0)
+    assert_eq(b.total_sectors16, 0)
+    assert_eq(b.fat_size16, 0)
+    assert_eq(b.root_entries, 0)
+
+@test("a volume on a device of 1024-byte sectors formats and reads back in that sector size")
+larger_sectors()
+    var dev = ram_device(20000, 1024)
+    val g = formatted(&dev)
+    assert_eq(g.bytes_per_sector, 1024)
+    assert_eq(read_back(&dev).unwrap(), g)
+
+@test("format writes nothing past a device it refuses, and the error says why")
+format_refusals()
+    var tiny = ram_device(8000)
+    assert_eq(format(&tiny).unwrap_err(), FormatError.TooSmall)
+    for k in 0..<tiny.image().len
+        assert_eq(tiny.image()[k], 0)
+
+// A formatted FAT16 volume's boot sector with one thing changed by `spoil`, read back.
+private spoiled(spoil: (*BootSector, []u8) -> unit, device_sectors: u64 = 20000) -> Result[Geometry, BootError]
+    var dev = ram_device(20000)
+    formatted(&dev)
+    var boot = sector_of(&dev, 0)
+    spoil(at(boot.view(), 0), boot.view())
+    parse_boot_sector(boot.view(), 512, device_sectors)
+
+private spoiled32(spoil: *Fat32Tail -> unit) -> Result[Geometry, BootError]
+    var dev = ram_device(70000)
+    formatted(&dev, Some(FatType.Fat32))
+    var boot = sector_of(&dev, 0)
+    spoil(at(boot.view(), TAIL_OFFSET))
+    parse_boot_sector(boot.view(), 512, 70000)
+
+private no_fat_size(b: *BootSector, s: []u8)
+    b.fat_size16 = 0
+    for k in 36usize..<40
+        s[k] = 0
+
+@test("every field the spec constrains is checked, and the error names it")
+boot_sector_refusals()
+    assert_eq(spoiled((b, s) -> s[511] = 0).unwrap_err(), BootError.NoSignature)
+    assert_eq(spoiled((b, s) -> s[0] = 0x00).unwrap_err(), BootError.BadJump)
+    assert(spoiled((b, s) -> s[0] = 0xE9).is_ok())
+    assert_eq(spoiled((b, s) -> b.bytes_per_sector = 768).unwrap_err(), BootError.BadSectorSize)
+    assert_eq(spoiled((b, s) -> b.bytes_per_sector = 1024).unwrap_err(), BootError.SectorSizeMismatch)
+    assert_eq(spoiled((b, s) -> b.sectors_per_cluster = 3).unwrap_err(), BootError.BadClusterSize)
+    assert_eq(spoiled((b, s) -> b.sectors_per_cluster = 0).unwrap_err(), BootError.BadClusterSize)
+    assert_eq(spoiled((b, s) -> b.sectors_per_cluster = 128).unwrap_err(), BootError.BadClusterSize)
+    assert_eq(spoiled((b, s) -> b.reserved_sectors = 0).unwrap_err(), BootError.NoReservedSectors)
+    assert_eq(spoiled((b, s) -> b.fat_count = 0).unwrap_err(), BootError.NoFats)
+    assert_eq(spoiled((b, s) -> b.root_entries = 17).unwrap_err(), BootError.BadRootEntries)
+    assert_eq(spoiled((b, s) -> b.media = 0x12).unwrap_err(), BootError.BadMedia)
+    assert_eq(spoiled((b, s) -> b.total_sectors16 = 0).unwrap_err(), BootError.NoSectors)
+    assert_eq(spoiled((b, s) -> (), device_sectors = 19999).unwrap_err(), BootError.PastDeviceEnd)
+    // With no 16-bit FAT size the spec reads the 32-bit one, which on FAT16 lies over the drive number
+    // and signature: here those make a FAT bigger than the volume.
+    assert_eq(spoiled((b, s) -> b.fat_size16 = 0).unwrap_err(), BootError.NoDataRegion)
+    assert_eq(spoiled(no_fat_size).unwrap_err(), BootError.NoFatSize)
+    assert_eq(spoiled((b, s) -> b.reserved_sectors = 20000).unwrap_err(), BootError.NoDataRegion)
+    assert_eq(spoiled((b, s) -> b.fat_size16 = 10).unwrap_err(), BootError.FatTooSmall)
+    // Four times the cluster size leaves under 4,085 clusters: FAT12, which the package refuses.
+    assert_eq(spoiled((b, s) -> b.sectors_per_cluster = 8).unwrap_err(), BootError.Fat12)
+
+private no_hints(t: *Fat32Tail)
+    t.fs_info = 0xFFFF
+    t.backup_boot = 0xFFFF
+
+@test("a FAT32 boot sector's own fields are checked: version, root cluster, and FAT32's layout for FAT32's count")
+fat32_refusals()
+    assert(spoiled32((t) -> ()).is_ok())
+    assert_eq(spoiled32((t) -> t.version = 1).unwrap_err(), BootError.BadVersion)
+    assert_eq(spoiled32((t) -> t.root_cluster = 1).unwrap_err(), BootError.BadRootCluster)
+    assert_eq(spoiled32((t) -> t.root_cluster = 0x0FFF_FFF0).unwrap_err(), BootError.BadRootCluster)
+    // No FSInfo and no backup are allowed; they are hints, and read back as sector 0.
+    val bare = spoiled32(no_hints).unwrap()
+    assert_eq(bare.fs_info_sector, 0)
+    assert_eq(bare.backup_boot_sector, 0)
+
+@test("a cluster count that says FAT16 under FAT32's fields, or the reverse, is refused")
+type_mismatch()
+    // FAT32's count with a 16-bit FAT size present.
+    var dev = ram_device(70000)
+    formatted(&dev, Some(FatType.Fat32))
+    var boot = sector_of(&dev, 0)
+    val b: *BootSector = at(boot.view(), 0)
+    b.fat_size16 = 600
+    assert_eq(parse_boot_sector(boot.view(), 512, 70000).unwrap_err(), BootError.TypeMismatch)
+    // FAT16's count with no fixed root directory.
+    assert_eq(spoiled((b, s) -> b.root_entries = 0).unwrap_err(), BootError.TypeMismatch)
+
+@test("a volume laid out as FAT32 reads as FAT32 even with FAT16's count of clusters, as Linux reads one")
+small_fat32_reads()
+    // Eight times the cluster size leaves about 8,600 clusters under FAT32's layout.
+    val g = spoiled32((t) -> ()).unwrap()
+    var dev = ram_device(70000)
+    formatted(&dev, Some(FatType.Fat32))
+    var boot = sector_of(&dev, 0)
+    val b: *BootSector = at(boot.view(), 0)
+    b.sectors_per_cluster = 8
+    val small = parse_boot_sector(boot.view(), 512, 70000).unwrap()
+    assert_eq(small.fat_type, FatType.Fat32)
+    assert(small.clusters < FAT32_MIN_CLUSTERS)
+    assert_eq(small.fat_sectors, g.fat_sectors)
+
+@test("the type is the cluster count's, at both boundaries")
+type_boundaries()
+    assert_eq(fat_type_of(4084), FatType.Fat12)
+    assert_eq(fat_type_of(4085), FatType.Fat16)
+    assert_eq(fat_type_of(65524), FatType.Fat16)
+    assert_eq(fat_type_of(65525), FatType.Fat32)

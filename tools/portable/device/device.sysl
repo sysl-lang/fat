@@ -1,0 +1,37 @@
+module device
+
+import sh.sysl.fat.{BlockDevice, DeviceError}
+import sysl.slices.copy
+
+// A device with no operating system behind it: a few sectors of static memory, standing in for an SD
+// card or a virtio disk. It reports the size of a volume large enough for FAT16 and answers reads past its
+// storage with zeros, which is all a build needs.
+
+const STORED: usize = 64 * 512
+
+private var storage: [STORED]u8
+
+struct StaticDevice
+    count: u64
+
+impl BlockDevice for StaticDevice
+    sector_size(self) -> usize = 512
+    sectors(self) -> u64 = self.count
+
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        val at = usize(s) * 512
+        if at + 512 <= STORED
+            copy(out, storage[at..<at + 512])
+        else
+            for i in 0..<out.len
+                out[i] = 0
+        Ok(())
+
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        val at = usize(s) * 512
+        if at + 512 <= STORED then copy(storage[at..<at + 512], data)
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError] = Ok(())

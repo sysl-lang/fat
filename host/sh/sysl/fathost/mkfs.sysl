@@ -1,0 +1,137 @@
+module sh.sysl.fathost
+@requires(os)
+
+import sh.sysl.fat.{FatType, FormatError, Geometry, format, plan}
+
+// mkfs.fat's command line, spelled as dosfstools spells it so a script written for one works with the
+// other, for the options both have:
+//
+//   mkfs.fat [-F 16|32] [-s sectors-per-cluster] [-S sector-size] [-n label] [-i volume-id] [-C] <image> [KiB]
+//
+// Without -F the type follows the volume's size: FAT16 up to 512 MiB, FAT32 above (sh.sysl.fat.format).
+// -C creates the image at KiB kibibytes; otherwise the image (or device) is formatted at its own size.
+
+val MKFS_USAGE: string = "usage: mkfs.fat [-F 16|32] [-s sectors-per-cluster] [-S sector-size] [-n label] [-i volume-id] [-C] <image> [KiB]"
+
+// What went wrong, in words.
+format_message(e: FormatError) -> string = e match
+    FormatError.Device(_) -> "the device could not be written"
+    FormatError.BadSectorSize -> "the sector size must be 512, 1024, 2048 or 4096"
+    FormatError.TooSmall -> "the volume is too small for the FAT type (4.1 MB is FAT16's least; FAT32's is 32.5 MB)"
+    FormatError.TooLarge -> "the volume is too large for the FAT type (FAT16 ends at 2 GiB; FAT32 at 2^32 sectors)"
+    FormatError.BadClusterSize -> "the cluster size must be a power of two sectors, of at most 32 KiB"
+    FormatError.ClusterCountOutOfRange -> "that cluster size gives a count of clusters outside the FAT type's range"
+    FormatError.BadLabel -> "a label is 1 to 11 characters, none of them \" * + , . / : ; < = > ? [ \\ ] |"
+
+// A whole decimal number, or a hexadecimal one after `0x` (or, with `hex`, without it).
+private number(text: string, hex: bool = false) -> Option[u64]
+    var digits = text
+    var base = if hex then 16u64 else 10u64
+    if text.len > 2 && text[0] == u8('0') && (text[1] == u8('x') || text[1] == u8('X'))
+        digits = text[2..]
+        base = 16
+    if digits.len == 0 then return None
+    var n = 0u64
+    for i in 0..<digits.len
+        val c = digits[i]
+        val d = if c >= u8('0') && c <= u8('9') then u64(c - u8('0'))
+                else if base == 16 && c >= u8('a') && c <= u8('f') then u64(c - u8('a') + 10)
+                else if base == 16 && c >= u8('A') && c <= u8('F') then u64(c - u8('A') + 10)
+                else return None
+        if n > (0xFFFF_FFFF_FFFF_FFFF - d) / base then return None
+        n = n * base + d
+    Some(n)
+
+private value(args: []string, i: usize, flag: string) -> Result[string, string] =
+    if i < args.len then Ok(args[i]) else Err(f"mkfs.fat: $flag needs a value\n$MKFS_USAGE")
+
+private numeric(args: []string, i: usize, flag: string, hex: bool = false) -> Result[u64, string]
+    val text = value(args, i, flag)?
+    number(text, hex) match
+        Some(n) -> Ok(n)
+        None -> Err(f"mkfs.fat: '$text' is not a number for $flag")
+
+// A type as it is written in prose and in the boot sector.
+type_name(kind: FatType) -> string = kind match
+    FatType.Fat12 -> "FAT12"
+    FatType.Fat16 -> "FAT16"
+    FatType.Fat32 -> "FAT32"
+
+// The line printed for a volume that was made.
+summary(image: string, g: Geometry) -> string =
+    f"mkfs.fat: $image: ${type_name(g.fat_type)}, ${g.total_sectors} sectors of ${g.bytes_per_sector} bytes, ${g.clusters} clusters of ${g.cluster_bytes()} bytes"
+
+// Run mkfs.fat on `args` (without the program's name). `volume_id` is what -i gives when it is not
+// given: the caller's clock, as dosfstools does. The answer is what to print.
+run_mkfs(args: []string, volume_id: u32) -> Result[string, string]
+    var kind: Option[FatType] = None
+    var spc = 0u64
+    var sector_size = 512u64
+    var label = "NO NAME"
+    var id = volume_id
+    var create = false
+    var positional: [2]string = ["", ""]
+    var given = 0usize
+    var i = 0usize
+    while i < args.len
+        val a = args[i]
+        if a == "-F"
+            kind = numeric(args, i + 1, a)? match
+                16 -> Some(FatType.Fat16)
+                32 -> Some(FatType.Fat32)
+                _ -> return Err(f"mkfs.fat: -F takes 16 or 32 (FAT12 is not written)")
+            i += 2
+        elif a == "-s"
+            spc = numeric(args, i + 1, a)?
+            i += 2
+        elif a == "-S"
+            sector_size = numeric(args, i + 1, a)?
+            i += 2
+        elif a == "-n"
+            label = value(args, i + 1, a)?
+            i += 2
+        elif a == "-i"
+            id = u32(numeric(args, i + 1, a, hex = true)? & 0xFFFF_FFFF)
+            i += 2
+        elif a == "-C"
+            create = true
+            i += 1
+        elif a.len > 0 && a[0] == u8('-')
+            return Err(f"mkfs.fat: unknown option '$a'\n$MKFS_USAGE")
+        else
+            if given == 2 then return Err(f"mkfs.fat: too many arguments\n$MKFS_USAGE")
+            positional[given] = a
+            given += 1
+            i += 1
+
+    if given == 0 then return Err(MKFS_USAGE)
+    val image = positional[0]
+    if sector_size != 512 && sector_size != 1024 && sector_size != 2048 && sector_size != 4096
+        return Err(f"mkfs.fat: ${format_message(FormatError.BadSectorSize)}")
+    val cluster_bytes = u32(spc * sector_size)
+    if spc > 128 then return Err(f"mkfs.fat: ${format_message(FormatError.BadClusterSize)}")
+
+    var dev = if create
+        if given != 2 then return Err(f"mkfs.fat: -C needs the size in KiB after the image\n$MKFS_USAGE")
+        val kib = number(positional[1]) match
+            Some(n) -> n
+            None -> return Err(f"mkfs.fat: '${positional[1]}' is not a size in KiB")
+        val sectors = kib * 1024 / sector_size
+        // The shape is settled before the image is touched, so a refused size leaves any file alone.
+        plan(sectors, usize(sector_size), kind, cluster_bytes, label, id) match
+            Ok(_) -> ()
+            Err(e) -> return Err(f"mkfs.fat: ${format_message(e)}")
+        create_image(image, sectors, usize(sector_size)) match
+            Ok(d) -> d
+            Err(_) -> return Err(f"mkfs.fat: cannot create $image")
+    else
+        if given != 1 then return Err(f"mkfs.fat: a size is given only with -C\n$MKFS_USAGE")
+        open_image(image, usize(sector_size)) match
+            Ok(d) -> d
+            Err(_) -> return Err(f"mkfs.fat: cannot open $image")
+
+    val made = format(&dev, kind, cluster_bytes, label, id)
+    dev.close()
+    made match
+        Ok(g) -> Ok(summary(image, g))
+        Err(e) -> Err(f"mkfs.fat: ${format_message(e)}")

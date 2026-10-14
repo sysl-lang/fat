@@ -1,0 +1,147 @@
+module sh.sysl.fat
+@tests
+@requires(heap)
+
+// The cluster size and type `plan` picks at every edge of the spec's two tables (section 3.5), in
+// 512-byte sectors. Each row is (sectors, FAT32 asked for, type expected, sectors per cluster expected).
+private check_choice(sectors: u64, kind: Option[FatType], want: FatType, spc: u32)
+    val g = planned(plan(sectors, 512, kind))
+    assert_eq(g.fat_type, want)
+    assert_eq(g.sectors_per_cluster, spc)
+
+private planned(r: Result[Geometry, FormatError]) -> Geometry = r match
+    Ok(g) -> g
+    Err(e) -> panic(f"plan refused: $e")
+
+private refused(sectors: u64, kind: Option[FatType]) -> FormatError = plan(sectors, 512, kind) match
+    Ok(_) -> panic("plan accepted a size it should refuse")
+    Err(e) -> e
+
+@test("left to choose, format makes FAT16 up to 512 MiB with the spec's FAT16 cluster sizes")
+automatic_fat16_rows()
+    check_choice(8401, None, FatType.Fat16, 2)
+    check_choice(32680, None, FatType.Fat16, 2)
+    check_choice(32681, None, FatType.Fat16, 4)
+    check_choice(262144, None, FatType.Fat16, 4)
+    check_choice(262145, None, FatType.Fat16, 8)
+    check_choice(524288, None, FatType.Fat16, 8)
+    check_choice(524289, None, FatType.Fat16, 16)
+    check_choice(1048576, None, FatType.Fat16, 16)
+
+@test("left to choose, format makes FAT32 past 512 MiB with the spec's FAT32 cluster sizes")
+automatic_fat32_rows()
+    check_choice(1048577, None, FatType.Fat32, 8)
+    check_choice(16777216, None, FatType.Fat32, 8)
+    check_choice(16777217, None, FatType.Fat32, 16)
+    check_choice(33554432, None, FatType.Fat32, 16)
+    check_choice(33554433, None, FatType.Fat32, 32)
+    check_choice(67108864, None, FatType.Fat32, 32)
+    check_choice(67108865, None, FatType.Fat32, 64)
+    check_choice(0xFFFF_FFFF, None, FatType.Fat32, 64)
+
+@test("FAT16 asked for by name uses the table's rows past 512 MiB, up to 2 GiB")
+forced_fat16_rows()
+    check_choice(1048577, Some(FatType.Fat16), FatType.Fat16, 32)
+    check_choice(2097152, Some(FatType.Fat16), FatType.Fat16, 32)
+    check_choice(2097153, Some(FatType.Fat16), FatType.Fat16, 64)
+    // The table's last row says "up to 2 GB", but 32 KiB clusters over all of 2 GiB come to 65,527 of
+    // them, which is FAT32's count; the type rule wins, so FAT16 ends where the count reaches 65,525.
+    check_choice(4194144, Some(FatType.Fat16), FatType.Fat16, 64)
+    assert_eq(refused(4194145, Some(FatType.Fat16)), FormatError.ClusterCountOutOfRange)
+    assert_eq(refused(4194304, Some(FatType.Fat16)), FormatError.ClusterCountOutOfRange)
+    assert_eq(refused(4194305, Some(FatType.Fat16)), FormatError.TooLarge)
+
+@test("FAT32 asked for by name goes down to the table's 32.5 MB, with 512-byte clusters up to 260 MB")
+forced_fat32_rows()
+    assert_eq(refused(66600, Some(FatType.Fat32)), FormatError.TooSmall)
+    check_choice(66601, Some(FatType.Fat32), FatType.Fat32, 1)
+    check_choice(532480, Some(FatType.Fat32), FatType.Fat32, 1)
+    check_choice(532481, Some(FatType.Fat32), FatType.Fat32, 8)
+
+@test("a volume of 4.1 MB or less would be FAT12 and is refused, as is FAT12 by name and a device past 2^32 sectors")
+too_small_and_too_large()
+    assert_eq(refused(8400, None), FormatError.TooSmall)
+    assert_eq(refused(100, None), FormatError.TooSmall)
+    assert_eq(refused(1_000_000, Some(FatType.Fat12)), FormatError.TooSmall)
+    assert_eq(refused(0x1_0000_0000, None), FormatError.TooLarge)
+
+// Every plan's numbers hold together: the regions follow one another inside the volume, the count of
+// clusters is the type's, and one FAT has an entry for every cluster plus the two reserved ones.
+private check_consistent(g: Geometry)
+    assert_eq(g.first_data_sector, g.reserved_sectors + g.fat_count * g.fat_sectors + g.root_dir_sectors)
+    assert(g.first_data_sector < g.total_sectors)
+    assert_eq(g.clusters, (g.total_sectors - g.first_data_sector) / g.sectors_per_cluster)
+    assert_eq(fat_type_of(g.clusters), g.fat_type)
+    val per_sector = g.bytes_per_sector / (if g.fat_type == FatType.Fat32 then 4u32 else 2u32)
+    assert(u64(g.fat_sectors) * u64(per_sector) >= u64(g.clusters) + 2)
+    // ...and not wastefully. The spec's computation divides by 128 x spc + 1 entries' worth per FAT32
+    // sector where the exact figure is 128 x spc + 2, so it may overshoot the smallest FAT that would do
+    // by up to total / (128 x spc)^2 sectors, plus one for rounding; never by more.
+    var least = g.fat_sectors
+    loop
+        val m = least - 1
+        val clusters_then = (g.total_sectors - g.reserved_sectors - g.fat_count * m - g.root_dir_sectors) / g.sectors_per_cluster
+        if u64(m) * u64(per_sector) < u64(clusters_then) + 2 then break
+        least = m
+    val step = u64(per_sector) * u64(g.sectors_per_cluster)
+    val slack = 1 + u64(g.total_sectors) / (step * step)
+    if u64(g.fat_sectors - least) > slack
+        panic(f"a FAT of ${g.fat_sectors} sectors where ${least} would do, for ${g.total_sectors} sectors, ${g.fat_type}, spc ${g.sectors_per_cluster}")
+
+@test("every plan across the sizes and sector sizes is self-consistent and its FAT is the right size")
+plans_are_consistent()
+    for sectors in [8401u64, 20000, 32681, 100000, 524289, 1048576, 1048577, 5000000, 40000000, 0xFFFF_FFFF]
+        check_consistent(planned(plan(sectors, 512)))
+    for sectors in [2000000u64, 4194144]
+        check_consistent(planned(plan(sectors, 512, Some(FatType.Fat16))))
+    for sectors in [66601u64, 532480, 532481]
+        check_consistent(planned(plan(sectors, 512, Some(FatType.Fat32))))
+    for size in [1024u64, 2048, 4096]
+        val g = planned(plan(1048576 * 512 / size, usize(size)))
+        assert_eq(g.bytes_per_sector, u32(size))
+        assert_eq(g.cluster_bytes(), 8192)
+        check_consistent(g)
+        val big = planned(plan(4_000_000_000 / size, usize(size)))
+        assert_eq(big.cluster_bytes(), 4096)
+        check_consistent(big)
+
+@test("a table cluster smaller than a 4096-byte sector becomes one sector; an asked-for one is refused")
+cluster_smaller_than_sector()
+    val g = planned(plan(300_000_000 / 4096, 4096, Some(FatType.Fat32)))
+    assert_eq(g.sectors_per_cluster, 1)
+    check_consistent(g)
+    // Under 268 MB, clusters of one 4096-byte sector are too few for FAT32, where the table's 512-byte
+    // ones would have been enough: refused, not silently made FAT16.
+    assert_eq(plan(100_000_000 / 4096, 4096, Some(FatType.Fat32)).unwrap_err(), FormatError.ClusterCountOutOfRange)
+    assert_eq(plan(100000, 4096, cluster_bytes = 2048).unwrap_err(), FormatError.BadClusterSize)
+
+@test("an asked-for cluster size is used, and one that is not a power of two or is past 32 KiB is refused")
+asked_for_cluster_size()
+    val g = planned(plan(1048576, 512, Some(FatType.Fat32), cluster_bytes = 4096))
+    assert_eq(g.sectors_per_cluster, 8)
+    check_consistent(g)
+    val small = planned(plan(100000, 512, cluster_bytes = 1024))
+    assert_eq(small.sectors_per_cluster, 2)
+    assert_eq(small.fat_type, FatType.Fat16)
+    check_consistent(small)
+    // 4 KiB clusters over 512 MiB are 131,072 of them: FAT32's count, so FAT16 (the type 512 MiB gets
+    // by itself) cannot have them.
+    assert_eq(plan(1048576, 512, cluster_bytes = 4096).unwrap_err(), FormatError.ClusterCountOutOfRange)
+    assert_eq(plan(1048576, 512, cluster_bytes = 3000).unwrap_err(), FormatError.BadClusterSize)
+    assert_eq(plan(1048576, 512, cluster_bytes = 65536).unwrap_err(), FormatError.BadClusterSize)
+    // A cluster size that pushes the count out of the type's range is refused, not silently changed.
+    assert_eq(plan(1048576, 512, Some(FatType.Fat32), cluster_bytes = 32768).unwrap_err(),
+              FormatError.ClusterCountOutOfRange)
+
+@test("a label is upper-cased and padded to eleven bytes; a long, empty or forbidden one is refused")
+labels()
+    assert_eq(volume_label("boot").unwrap(), [u8('B'), u8('O'), u8('O'), u8('T'), 32, 32, 32, 32, 32, 32, 32])
+    assert_eq(volume_label("NO NAME").unwrap()[7], 32)
+    assert(volume_label("ELEVEN CHAR").is_some())
+    assert(volume_label("TWELVE CHARS").is_none())
+    assert(volume_label("").is_none())
+    assert(volume_label(" LEADING").is_none())
+    assert(volume_label("A.B").is_none())
+    assert(volume_label("A*B").is_none())
+    assert(plan(1048576, 512, label = "A?B").is_err())
+    assert(plan(20000, 300).is_err())

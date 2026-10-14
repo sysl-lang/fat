@@ -1,0 +1,10 @@
+// mkfs.fat: format an image file or a device as a FAT16 or FAT32 volume.
+
+package {
+  name    = "mkfs-fat"
+  version = "0.0.1"
+}
+
+dependencies {
+  fathost { workspace = true }
+}

@@ -1,0 +1,277 @@
+module sh.sysl.fat
+
+import sysl.slices.fill
+
+// Formatting a device: choosing the FAT type and cluster size for its size, laying the volume out, and
+// writing the reserved area, both FATs and an empty root directory.
+//
+// The choice follows the spec's own tables (section 3.5, `DskTableFAT16` and `DskTableFAT32`), which map
+// a volume's size to the cluster size Microsoft's formatter uses. Left to choose the type, `format` makes
+// FAT16 up to 512 MiB and FAT32 above, which is where those tables hand over: past 512 MiB the FAT16
+// table's rows are "not used unless FAT16 is forced". A volume too small for FAT16 (4.1 MB and under)
+// would need FAT12, which the package does not write.
+
+// Why a device could not be formatted.
+enum FormatError derives Eq, Display
+    Device(error: DeviceError)
+    BadSectorSize
+    TooSmall
+    TooLarge
+    BadClusterSize
+    ClusterCountOutOfRange
+    BadLabel
+
+impl From[DeviceError] for FormatError
+    from(e: DeviceError) -> FormatError = FormatError.Device(e)
+
+// One row of a cluster-size table: volumes of up to `up_to` 512-byte sectors get clusters of
+// `sectors_per_cluster` 512-byte sectors. Zero means no cluster size fits: the volume is too small or
+// too large for the type.
+struct SizeRow
+    up_to: u32
+    sectors_per_cluster: u32
+
+// The spec's `DskTableFAT16`. The rows past 512 MiB are used only when FAT16 is asked for by name.
+val FAT16_TABLE: [8]SizeRow = [
+    SizeRow(8400, 0),
+    SizeRow(32680, 2),
+    SizeRow(262144, 4),
+    SizeRow(524288, 8),
+    SizeRow(1048576, 16),
+    SizeRow(2097152, 32),
+    SizeRow(4194304, 64),
+    SizeRow(0xFFFF_FFFF, 0),
+]
+
+// The spec's `DskTableFAT32`.
+val FAT32_TABLE: [6]SizeRow = [
+    SizeRow(66600, 0),
+    SizeRow(532480, 1),
+    SizeRow(16777216, 8),
+    SizeRow(33554432, 16),
+    SizeRow(67108864, 32),
+    SizeRow(0xFFFF_FFFF, 64),
+]
+
+// Where `format` stops choosing FAT16 by itself, in 512-byte sectors: 512 MiB.
+val FAT16_AUTO_LIMIT: u64 = 1048576
+
+// The type `format` picks for a volume of `bytes` bytes when it is not told.
+automatic_type(bytes: u64) -> FatType = if bytes / 512 <= FAT16_AUTO_LIMIT then FatType.Fat16 else FatType.Fat32
+
+// The cluster size the spec's table gives a volume of `bytes` bytes of type `kind`, in bytes; or why
+// there is none.
+table_cluster_bytes(kind: FatType, bytes: u64) -> Result[u32, FormatError]
+    val units = bytes / 512
+    val table: []const SizeRow = if kind == FatType.Fat32 then FAT32_TABLE[..] else FAT16_TABLE[..]
+    for i in 0..<table.len
+        val row = table[i]
+        if units <= u64(row.up_to)
+            if row.sectors_per_cluster != 0 then return Ok(row.sectors_per_cluster * 512)
+            return Err(if i == 0 then FormatError.TooSmall else FormatError.TooLarge)
+    Err(FormatError.TooLarge)
+
+// The FAT's size in sectors for a volume, by the spec's computation (section 3.5), generalised from its
+// 512-byte sectors by entries per sector. It may give a sector or two more than needed and never fewer;
+// the loop after it makes sure of the second.
+private fat_size(kind: FatType, total: u32, bps: u32, spc: u32, reserved: u32, fats: u32, root_dir_sectors: u32) -> u32
+    val tmp1 = u64(total) - u64(reserved) - u64(root_dir_sectors)
+    var tmp2 = u64(bps / 2) * u64(spc) + u64(fats)
+    if kind == FatType.Fat32 then tmp2 /= 2
+    var size = u32((tmp1 + tmp2 - 1) / tmp2)
+    val per_sector = u64(bps) / (if kind == FatType.Fat32 then 4u64 else 2u64)
+    loop
+        val data = u64(total) - u64(reserved) - u64(fats) * u64(size) - u64(root_dir_sectors)
+        if u64(size) * per_sector >= data / u64(spc) + 2 then return size
+        size += 1
+
+// A label as the boot sector keeps it: eleven bytes, upper case, padded with spaces. The characters the
+// spec forbids in a short name are refused (section 6.1), except the space, which a label may hold.
+volume_label(text: string) -> Option[[11]u8]
+    if text.len > 11 then return None
+    var out: [11]u8 = [u8(' '); 11]
+    for i in 0..<text.len
+        var c = text[i]
+        if c < 0x20 || c == 0x7F then return None
+        val forbidden = "\"*+,./:;<=>?[\\]|"
+        for j in 0..<forbidden.len
+            if c == forbidden[j] then return None
+        if c >= u8('a') && c <= u8('z') then c -= 32
+        out[i] = c
+    if out[0] == u8(' ') then return None
+    Some(out)
+
+// The volume `format` would make on a device of `device_sectors` sectors of `sector_size` bytes, without
+// writing anything. `fat_type` None lets it choose; `cluster_bytes` 0 takes the spec's table.
+plan(device_sectors: u64, sector_size: usize, fat_type: Option[FatType] = None, cluster_bytes: u32 = 0,
+     label: string = NO_LABEL, volume_id: u32 = 0, hidden_sectors: u32 = 0) -> Result[Geometry, FormatError]
+    val bps = u32(sector_size)
+    if bps != 512 && bps != 1024 && bps != 2048 && bps != 4096 then return Err(FormatError.BadSectorSize)
+    if device_sectors > 0xFFFF_FFFF then return Err(FormatError.TooLarge)
+    val total = u32(device_sectors)
+    val bytes = u64(total) * u64(bps)
+    val kind = fat_type match
+        Some(FatType.Fat12) -> return Err(FormatError.TooSmall)
+        Some(t) -> t
+        None -> automatic_type(bytes)
+    val label_bytes = volume_label(label) match
+        Some(l) -> l
+        None -> return Err(FormatError.BadLabel)
+
+    val wanted = if cluster_bytes != 0 then cluster_bytes else table_cluster_bytes(kind, bytes)?
+    if wanted & (wanted - 1) != 0 || wanted > 32768 then return Err(FormatError.BadClusterSize)
+    // A table cluster smaller than a sector is a cluster of one sector; an asked-for one is refused.
+    if wanted < bps && cluster_bytes != 0 then return Err(FormatError.BadClusterSize)
+    val spc = if wanted < bps then 1u32 else wanted / bps
+
+    val fat32 = kind == FatType.Fat32
+    val reserved = if fat32 then 32u32 else 1u32
+    val fats = 2u32
+    val root_entries = if fat32 then 0u32 else 512u32
+    val root_dir_sectors = (root_entries * 32 + bps - 1) / bps
+    if u64(total) <= u64(reserved + root_dir_sectors) + u64(fats) + u64(spc) then return Err(FormatError.TooSmall)
+
+    val fat_sectors = fat_size(kind, total, bps, spc, reserved, fats, root_dir_sectors)
+    val first_data = reserved + fats * fat_sectors + root_dir_sectors
+    if first_data >= total then return Err(FormatError.TooSmall)
+    val clusters = (total - first_data) / spc
+    if fat_type_of(clusters) != kind || clusters > FAT32_MAX_CLUSTERS then return Err(FormatError.ClusterCountOutOfRange)
+
+    Ok(Geometry(kind, bps, spc, reserved, fats, fat_sectors, root_entries, root_dir_sectors, total,
+                first_data, clusters, if fat32 then 2 else 0, if fat32 then 1 else 0, if fat32 then 6 else 0,
+                hidden_sectors, 0xF8, volume_id, label_bytes))
+
+// The bytes of `s` as an array of exactly `N`; `s` is `N` bytes long.
+private text_bytes[const N: usize](s: string) -> [N]u8
+    var out: [N]u8 = [0; N]
+    for i in 0..<N
+        out[i] = s[i]
+    out
+
+// The boot sector of a volume of geometry `g`, into `out` (one sector, zeroed here first).
+write_boot_sector(g: Geometry, out: []u8)
+    fill(out, 0)
+    val b: *BootSector = at(out, 0)
+    val fat32 = g.fat_type == FatType.Fat32
+    b.jump = [0xEB, if fat32 then 0x58 else 0x3C, 0x90]
+    b.oem = text_bytes[8]("MSWIN4.1")
+    b.bytes_per_sector = u16(g.bytes_per_sector)
+    b.sectors_per_cluster = u8(g.sectors_per_cluster)
+    b.reserved_sectors = u16(g.reserved_sectors)
+    b.fat_count = u8(g.fat_count)
+    b.root_entries = u16(g.root_entries)
+    if !fat32 && g.total_sectors < 0x1_0000
+        b.total_sectors16 = u16(g.total_sectors)
+    else
+        b.total_sectors32 = g.total_sectors
+    b.media = g.media
+    b.sectors_per_track = 63
+    b.heads = 255
+    b.hidden_sectors = g.hidden_sectors
+    if fat32
+        val t: *Fat32Tail = at(out, TAIL_OFFSET)
+        t.fat_size32 = g.fat_sectors
+        t.root_cluster = g.root_cluster
+        t.fs_info = u16(g.fs_info_sector)
+        t.backup_boot = u16(g.backup_boot_sector)
+        t.drive = 0x80
+        t.boot_signature = EXTENDED_BOOT_SIGNATURE
+        t.volume_id = g.volume_id
+        t.label = g.label
+        t.fs_type = text_bytes[8]("FAT32   ")
+    else
+        b.fat_size16 = u16(g.fat_sectors)
+        val t: *Fat16Tail = at(out, TAIL_OFFSET)
+        t.drive = 0x80
+        t.boot_signature = EXTENDED_BOOT_SIGNATURE
+        t.volume_id = g.volume_id
+        t.label = g.label
+        t.fs_type = text_bytes[8]("FAT16   ")
+    out[SIGNATURE_OFFSET] = SIGNATURE[0]
+    out[SIGNATURE_OFFSET + 1] = SIGNATURE[1]
+
+// The FSInfo sector of a freshly formatted FAT32 volume of geometry `g`: every cluster free but the
+// root directory's, and the search for a free one starting just past it.
+write_fs_info(g: Geometry, out: []u8)
+    fill(out, 0)
+    val f: *FsInfo = at(out, 0)
+    f.lead_signature = FSINFO_LEAD
+    f.struct_signature = FSINFO_STRUCT
+    f.free_count = g.clusters - 1
+    f.next_free = g.root_cluster + 1
+    f.trail_signature = FSINFO_TRAIL
+
+// The first sector of a fresh FAT: entry 0 holds the media byte, entry 1 end-of-chain with the clean
+// shutdown and no-error bits set (spec section 4), and on FAT32 entry 2 ends the root directory's
+// one-cluster chain.
+write_first_fat_sector(g: Geometry, out: []u8)
+    fill(out, 0)
+    if g.fat_type == FatType.Fat32
+        put_entry32(out, 0, 0x0FFF_FF00 | u32(g.media))
+        put_entry32(out, 1, 0x0FFF_FFFF)
+        put_entry32(out, 2, 0x0FFF_FFFF)
+    else
+        put_entry16(out, 0, 0xFF00 | u16(g.media))
+        put_entry16(out, 1, 0xFFFF)
+
+// The label every volume is given unless asked for another, which is kept in the boot sector alone.
+val NO_LABEL: string = "NO NAME"
+
+// The first sector of a fresh root directory: empty, but for a volume label other than "NO NAME",
+// which the spec keeps twice — in the boot sector and as a root directory entry with the volume-ID
+// attribute (section 6) — and which fsck.fat removes from the boot sector when the entry is missing.
+write_first_root_sector(g: Geometry, out: []u8)
+    fill(out, 0)
+    if g.label == volume_label(NO_LABEL).unwrap() then return
+    val e: *DirEntry = at(out, 0)
+    e.name = g.label
+    e.attributes = ATTR_VOLUME_ID
+
+private put_entry16(out: []u8, i: usize, v: u16)
+    out[2 * i] = u8(v & 0xFF)
+    out[2 * i + 1] = u8(v >> 8)
+
+private put_entry32(out: []u8, i: usize, v: u32)
+    for k in 0usize..<4
+        out[4 * i + k] = u8((v >> u32(8 * k)) & 0xFF)
+
+// The largest sector the package handles; `format` keeps one of these on its stack.
+const MAX_SECTOR: usize = 4096
+
+// Format `dev` (see `plan` for the parameters) and answer the volume's geometry. The boot sector is
+// written last, so a format cut short leaves a device no reader takes for a volume.
+format[D: BlockDevice](dev: *D, fat_type: Option[FatType] = None, cluster_bytes: u32 = 0,
+                       label: string = NO_LABEL, volume_id: u32 = 0, hidden_sectors: u32 = 0) -> Result[Geometry, FormatError]
+    val g = plan(dev.sectors(), dev.sector_size(), fat_type, cluster_bytes, label, volume_id, hidden_sectors)?
+    var storage: [MAX_SECTOR]u8 = [0; MAX_SECTOR]
+    val sector = storage[..<dev.sector_size()]
+
+    fill(sector, 0)
+    for s in 0..<g.reserved_sectors
+        dev.write(u64(s), sector)?
+    for n in 0..<g.fat_count
+        val start = g.fat_start(n)
+        for s in 1..<g.fat_sectors
+            dev.write(u64(start + s), sector)?
+    val root = if g.fat_type == FatType.Fat32 then g.cluster_start(g.root_cluster) else g.root_dir_start()
+    val root_sectors = if g.fat_type == FatType.Fat32 then g.sectors_per_cluster else g.root_dir_sectors
+    for s in 1..<root_sectors
+        dev.write(u64(root + s), sector)?
+    write_first_root_sector(g, sector)
+    dev.write(u64(root), sector)?
+
+    write_first_fat_sector(g, sector)
+    for n in 0..<g.fat_count
+        dev.write(u64(g.fat_start(n)), sector)?
+
+    if g.fat_type == FatType.Fat32
+        write_fs_info(g, sector)
+        dev.write(u64(g.fs_info_sector), sector)?
+        dev.write(u64(g.backup_boot_sector + g.fs_info_sector), sector)?
+        write_boot_sector(g, sector)
+        dev.write(u64(g.backup_boot_sector), sector)?
+        dev.flush()?
+    write_boot_sector(g, sector)
+    dev.write(0, sector)?
+    dev.flush()?
+    Ok(g)

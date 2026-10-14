@@ -1,0 +1,22 @@
+// FAT16 and FAT32 in sysl: the on-disk format, the formatter, and (as it grows) reading and writing
+// files, over a block-device trait. Nothing in the package needs an operating system, an allocator or a
+// float, so the same source runs in a kernel (keel), on a microcontroller with an SD card (skiff) and on
+// the host, inside the tools.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       fat { git = "github.com/sysl-lang/fat", version = "<the first tag>" }
+//     }
+//
+// The module is `sh.sysl.fat`. The specification followed is Microsoft's "FAT: General Overview of
+// On-Disk Format", version 1.03 (fatgen103), cited by section as "the spec" throughout.
+
+package {
+  name    = "fat"
+  version = "0.0.1"
+}
+
+// The workspace's other members: `host` is the package on the host (a block device over an image
+// file), and `tools/*` are host programs (mkfs.fat).
+workspace = ["host", "tools/*"]

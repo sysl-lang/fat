@@ -1,0 +1,70 @@
+module sh.sysl.fat
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.copy
+
+// The block device everything in the package is written against: whole sectors, read and written by
+// number, and a flush that makes everything written before it durable.
+//
+// It is a trait and the algorithms are generic over it (`format[D: BlockDevice](dev: *D, ...)`), so an
+// SD card driver, a virtio disk, an image file and a test's device that fails on purpose are all just
+// implementations. The sector size is the device's: a volume whose boot sector names another is refused
+// rather than translated.
+
+enum DeviceError derives Display
+    OutOfRange
+    BadLength
+    Io
+
+trait BlockDevice
+    // The bytes in one sector: 512, 1024, 2048 or 4096.
+    sector_size(self) -> usize
+
+    // How many sectors the device has.
+    sectors(self) -> u64
+
+    // Copy sector `s` into `out`, which is exactly one sector.
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
+
+    // Write sector `s` from `data`, which is exactly one sector.
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+
+    // Everything written before this is durable once it returns.
+    flush(*self) -> Result[unit, DeviceError]
+
+// A device in memory, for tests and RAM disks. Unlike the rest of the package it allocates: its
+// sectors are one `Buf`.
+struct RamDevice
+    private bytes: Buf[u8]
+    private size: usize
+    private count: u64
+
+    // Every byte the device holds, for a test that looks at the raw image.
+    image(self) -> []const u8 = self.bytes.view()
+
+// A zero-filled device of `sectors` sectors of `sector_size` bytes.
+ram_device(sectors: u64, sector_size: usize = 512) -> RamDevice
+    var bytes: Buf[u8] = buf()
+    for _ in 0..<usize(sectors) * sector_size
+        bytes.push(0)
+    RamDevice(bytes, sector_size, sectors)
+
+impl BlockDevice for RamDevice
+    sector_size(self) -> usize = self.size
+    sectors(self) -> u64 = self.count
+
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
+        if out.len != self.size then return Err(DeviceError.BadLength)
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        val at = usize(s) * self.size
+        copy(out, self.bytes.view()[at..<at + self.size])
+        Ok(())
+
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != self.size then return Err(DeviceError.BadLength)
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        val at = usize(s) * self.size
+        copy(self.bytes.view()[at..<at + self.size], data)
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError] = Ok(())

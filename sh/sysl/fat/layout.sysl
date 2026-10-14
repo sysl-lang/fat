@@ -1,0 +1,124 @@
+module sh.sysl.fat
+
+import sysl.slices.as_mut_ptr
+
+// The on-disk structures of the spec's sections 3 and 5, each a `@packed`, little-endian struct whose
+// storage is the format's own bytes. The boot sector's fields are not on their natural boundaries
+// (`bytes_per_sector` is at offset 11), which is why every one is packed; each is read and written in
+// place through a pointer into a sector (`at[T]`), and its size is pinned by an `@assert`.
+
+// A structure inside a sector's bytes: `T` at `offset`. The bounds are checked here; a packed struct
+// has no alignment to keep.
+at[T](bytes: []u8, offset: usize) -> *T
+    if offset + sizeof(T) > bytes.len then panic("sh.sysl.fat: a structure past the end of its sector")
+    ptr_cast(usize(as_mut_ptr(bytes)) + offset)
+
+// The BIOS parameter block every FAT volume begins with (spec section 3.1), offsets 0-35.
+@packed
+@byte_order(little)
+struct BootSector
+    jump: [3]u8
+    oem: [8]u8
+    bytes_per_sector: u16
+    sectors_per_cluster: u8
+    reserved_sectors: u16
+    fat_count: u8
+    root_entries: u16
+    total_sectors16: u16
+    media: u8
+    fat_size16: u16
+    sectors_per_track: u16
+    heads: u16
+    hidden_sectors: u32
+    total_sectors32: u32
+
+@assert(sizeof(BootSector) == 36, "the common BPB is 36 bytes")
+
+// What follows the BPB on a FAT12 or FAT16 volume (spec section 3.2), offsets 36-61.
+@packed
+@byte_order(little)
+struct Fat16Tail
+    drive: u8
+    reserved: u8
+    boot_signature: u8
+    volume_id: u32
+    label: [11]u8
+    fs_type: [8]u8
+
+@assert(sizeof(Fat16Tail) == 26, "the FAT16 extended BPB is 26 bytes")
+
+// What follows the BPB on a FAT32 volume (spec section 3.3), offsets 36-89.
+@packed
+@byte_order(little)
+struct Fat32Tail
+    fat_size32: u32
+    ext_flags: u16
+    version: u16
+    root_cluster: u32
+    fs_info: u16
+    backup_boot: u16
+    reserved: [12]u8
+    drive: u8
+    reserved1: u8
+    boot_signature: u8
+    volume_id: u32
+    label: [11]u8
+    fs_type: [8]u8
+
+@assert(sizeof(Fat32Tail) == 54, "the FAT32 extended BPB is 54 bytes")
+
+// Where each part begins, and the signature every boot sector ends its first 512 bytes with.
+val TAIL_OFFSET: usize = 36
+val SIGNATURE_OFFSET: usize = 510
+val SIGNATURE: [2]u8 = [0x55, 0xAA]
+
+// The extended boot signature: it says the volume ID, label and type string after it are present.
+val EXTENDED_BOOT_SIGNATURE: u8 = 0x29
+
+// A 32-byte directory entry (spec section 6).
+@packed
+@byte_order(little)
+struct DirEntry
+    name: [11]u8
+    attributes: u8
+    nt_reserved: u8
+    created_tenths: u8
+    created_time: u16
+    created_date: u16
+    accessed_date: u16
+    first_cluster_high: u16
+    written_time: u16
+    written_date: u16
+    first_cluster_low: u16
+    size: u32
+
+@assert(sizeof(DirEntry) == 32, "a directory entry is 32 bytes")
+
+// The attribute bits of a directory entry.
+val ATTR_READ_ONLY: u8 = 0x01
+val ATTR_HIDDEN: u8 = 0x02
+val ATTR_SYSTEM: u8 = 0x04
+val ATTR_VOLUME_ID: u8 = 0x08
+val ATTR_DIRECTORY: u8 = 0x10
+val ATTR_ARCHIVE: u8 = 0x20
+
+// The FAT32 FSInfo sector (spec section 5): a hint of the free cluster count and where to look for one.
+@packed
+@byte_order(little)
+struct FsInfo
+    lead_signature: u32
+    reserved: [480]u8
+    struct_signature: u32
+    free_count: u32
+    next_free: u32
+    reserved2: [12]u8
+    trail_signature: u32
+
+@assert(sizeof(FsInfo) == 512, "the FSInfo structure fills a 512-byte sector")
+
+val FSINFO_LEAD: u32 = 0x4161_5252
+val FSINFO_STRUCT: u32 = 0x6141_7272
+val FSINFO_TRAIL: u32 = 0xAA55_0000
+
+// "Not known" in either of FSInfo's counts.
+val FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF

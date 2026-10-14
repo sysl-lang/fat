@@ -1,0 +1,16 @@
+// mkfs.fat — format an image file or a device as a FAT16 or FAT32 volume.
+//
+//   mkfs.fat [-F 16|32] [-s sectors-per-cluster] [-S sector-size] [-n label] [-i volume-id] [-C] <image> [KiB]
+//
+// Left to choose, it makes FAT16 up to 512 MiB and FAT32 above, with the cluster sizes of the FAT
+// specification's tables. The volume ID defaults to the clock, as dosfstools' does.
+
+import sh.sysl.fathost.run_mkfs
+import sysl.time
+
+main(args: []string)
+    run_mkfs(args[1..], u32(time.now().us & 0xFFFF_FFFF)) match
+        Ok(text) -> print(text)
+        Err(why) ->
+            print(why)
+            exit(1)

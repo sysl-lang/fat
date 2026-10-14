@@ -1,0 +1,59 @@
+module sh.sysl.fathost
+@requires(os)
+
+import sh.sysl.fat.{BlockDevice, DeviceError}
+import sysl.fs
+import sysl.io.Reader
+
+// A block device over an image file: sector `s` is bytes `s * size ..< (s + 1) * size` of the file.
+// Writes go to the operating system as they are made; `flush` asks it to make them durable.
+struct ImageDevice
+    private file: fs.File
+    private size: usize
+    private count: u64
+
+    // Hand back the file; further use of the device fails.
+    close(*self) -> bool = self.file.close().is_ok()
+
+impl BlockDevice for ImageDevice
+    sector_size(self) -> usize = self.size
+    sectors(self) -> u64 = self.count
+
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
+        if out.len != self.size then return Err(DeviceError.BadLength)
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        if self.file.seek(long(s) * long(self.size)).is_err() then return Err(DeviceError.Io)
+        val got = self.file.read(out)
+        if self.file.failed() || got.len != self.size then return Err(DeviceError.Io)
+        Ok(())
+
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != self.size then return Err(DeviceError.BadLength)
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        if self.file.seek(long(s) * long(self.size)).is_err() then return Err(DeviceError.Io)
+        self.file.write(data)
+        if self.file.failed() then return Err(DeviceError.Io)
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError]
+        if self.file.flush().is_err() || self.file.failed() then return Err(DeviceError.Io)
+        Ok(())
+
+// Open an existing image of `sector_size`-byte sectors; a trailing part sector is not used.
+open_image(path: string, sector_size: usize = 512) -> Result[ImageDevice, DeviceError]
+    var f = fs.open_update(path) match
+        Ok(f) -> f
+        Err(_) -> return Err(DeviceError.Io)
+    val size = f.size() match
+        Ok(n) -> n
+        Err(_) -> return Err(DeviceError.Io)
+    Ok(ImageDevice(f, sector_size, u64(size) / u64(sector_size)))
+
+// Make a new image of `sectors` sectors, replacing any file there. It is sparse where the host's
+// filesystem allows: only the sectors written take space.
+create_image(path: string, sectors: u64, sector_size: usize = 512) -> Result[ImageDevice, DeviceError]
+    var f = fs.create_update(path) match
+        Ok(f) -> f
+        Err(_) -> return Err(DeviceError.Io)
+    if f.truncate(long(sectors) * long(sector_size)).is_err() then return Err(DeviceError.Io)
+    Ok(ImageDevice(f, sector_size, sectors))

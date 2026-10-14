@@ -1,0 +1,146 @@
+module sh.sysl.fathost
+@tests
+@requires(os)
+
+import sh.sysl.fat.{FatType, Geometry, format, read_geometry}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_temp_dir, remove_dir_all}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.Search
+
+// The package's volumes against two independent FAT implementations on this machine: macOS's
+// fsck_msdos (from the BSDs) and dosfstools' fsck.fat (Linux's). Each must find a freshly formatted
+// volume clean, and fsck.fat's account of the geometry must agree with ours number for number. The
+// other direction, volumes those tools' formatters made read by ours, is below.
+
+val FSCK_FAT: string = "/opt/homebrew/sbin/fsck.fat"
+val MKFS_FAT: string = "/opt/homebrew/sbin/mkfs.fat"
+val FSCK_MSDOS: string = "/sbin/fsck_msdos"
+val MFORMAT: string = "/opt/homebrew/bin/mformat"
+
+private need_tools()
+    for tool in [FSCK_FAT, MKFS_FAT, FSCK_MSDOS, MFORMAT]
+        if !exists(tool) then skip(f"$tool is not installed (brew install dosfstools mtools)")
+
+// The decimal number that ends just before `marker` in `text` ("  10211 data clusters"), or that
+// starts just after it ("(= 40 sectors)" with the marker "(= ").
+private number_before(text: string, marker: string) -> u64
+    val at = text.index_of(marker).unwrap_or_else(() -> panic(f"fsck.fat said nothing of '$marker':\n$text"))
+    var i = at
+    while i > 0 && text[i - 1] == u8(' ')
+        i -= 1
+    var digits_from = i
+    while digits_from > 0 && text[digits_from - 1] >= u8('0') && text[digits_from - 1] <= u8('9')
+        digits_from -= 1
+    digits(text, digits_from, i)
+
+private number_after(text: string, marker: string) -> u64
+    val at = text.index_of(marker).unwrap_or_else(() -> panic(f"fsck.fat said nothing of '$marker':\n$text")) + marker.len
+    var end = at
+    while end < text.len && text[end] >= u8('0') && text[end] <= u8('9')
+        end += 1
+    digits(text, at, end)
+
+private digits(text: string, from: usize, to: usize) -> u64
+    if from == to then panic(f"no number at $from in:\n$text")
+    var n = 0u64
+    for i in from..<to
+        n = n * 10 + u64(text[i] - u8('0'))
+    n
+
+// Format a fresh sparse image of `sectors` sectors and check it with both tools.
+private check_with_both(dir: string, sectors: u64, kind: Option[FatType] = None, sector_size: usize = 512) -> Geometry
+    val image = f"$dir/v-$sectors-$sector_size.img"
+    var dev = create_image(image, sectors, sector_size).unwrap()
+    val g = format(&dev, kind, label = "ORACLE", volume_id = 0xC0FF_EE00) match
+        Ok(g) -> g
+        Err(e) -> panic(f"format refused $sectors sectors: $e")
+    dev.close()
+
+    val bsd = capture(FSCK_MSDOS, ["-n", image], stderr = true).unwrap()
+    val bsd_text = bsd.text + bsd.err.unwrap_or("")
+    if !bsd.status.ok() then panic(f"fsck_msdos rejected $sectors sectors:\n$bsd_text")
+    // An empty FAT32 volume has one cluster in use, the root directory's.
+    val free = if g.fat_type == FatType.Fat32 then g.clusters - 1 else g.clusters
+    assert_eq(number_after(bsd_text, " free ("), u64(free))
+
+    val linux = capture(FSCK_FAT, ["-n", "-v", image], stderr = true).unwrap()
+    val text = linux.text + linux.err.unwrap_or("")
+    if !linux.status.ok() then panic(f"fsck.fat rejected $sectors sectors:\n$text")
+    assert(!text.contains("differ"))
+    assert_eq(number_before(text, " bytes per logical sector"), u64(g.bytes_per_sector))
+    assert_eq(number_before(text, " bytes per cluster"), u64(g.cluster_bytes()))
+    assert_eq(number_before(text, " reserved sector"), u64(g.reserved_sectors))
+    assert_eq(number_before(text, " FATs, "), u64(g.fat_count))
+    assert_eq(number_after(text, "FATs, "), if g.fat_type == FatType.Fat32 then 32 else 16)
+    assert_eq(number_after(text, "(= "), u64(g.fat_sectors))
+    assert_eq(number_after(text, "Data area starts at byte "), u64(g.first_data_sector) * u64(g.bytes_per_sector))
+    assert_eq(number_before(text, " data clusters"), u64(g.clusters))
+    assert_eq(number_before(text, " sectors total"), u64(g.total_sectors))
+    g
+
+@test("fsck_msdos and fsck.fat find every automatic FAT16 size clean, and agree with its geometry")
+automatic_fat16_is_clean()
+    need_tools()
+    val dir = make_temp_dir("fat-oracle-").unwrap()
+    for sectors in [8401u64, 32681, 204800, 524289, 1048576]
+        assert_eq(check_with_both(dir, sectors).fat_type, FatType.Fat16)
+    remove_dir_all(dir).unwrap()
+
+@test("fsck_msdos and fsck.fat find every automatic FAT32 size clean, up to 64 KiB-cluster volumes past 32 GiB")
+automatic_fat32_is_clean()
+    need_tools()
+    val dir = make_temp_dir("fat-oracle-").unwrap()
+    for sectors in [1048577u64, 4194304, 16777217, 33554433, 67108865]
+        assert_eq(check_with_both(dir, sectors).fat_type, FatType.Fat32)
+    remove_dir_all(dir).unwrap()
+
+@test("both tools accept FAT16 and FAT32 asked for by name at the edges of their tables, and other sector sizes")
+forced_types_are_clean()
+    need_tools()
+    val dir = make_temp_dir("fat-oracle-").unwrap()
+    assert_eq(check_with_both(dir, 66601, Some(FatType.Fat32)).sectors_per_cluster, 1)
+    assert_eq(check_with_both(dir, 532481, Some(FatType.Fat32)).sectors_per_cluster, 8)
+    assert_eq(check_with_both(dir, 4194144, Some(FatType.Fat16)).sectors_per_cluster, 64)
+    assert_eq(check_with_both(dir, 40960, sector_size = 1024).bytes_per_sector, 1024)
+    assert_eq(check_with_both(dir, 262144, Some(FatType.Fat32), sector_size = 4096).bytes_per_sector, 4096)
+    remove_dir_all(dir).unwrap()
+
+// A volume made by another formatter, read by ours: the type and cluster size it was told to use, and
+// the cluster count fsck.fat finds there.
+private read_theirs(image: string, kind: FatType, cluster_bytes: u32)
+    var dev = open_image(image).unwrap()
+    var scratch: Buf[u8] = buf()
+    for _ in 0..<512
+        scratch.push(0)
+    val g = read_geometry(&dev, scratch.view()).unwrap()
+    dev.close()
+    assert_eq(g.fat_type, kind)
+    assert_eq(g.cluster_bytes(), cluster_bytes)
+    val linux = capture(FSCK_FAT, ["-n", "-v", image], stderr = true).unwrap()
+    assert_eq(number_before(linux.text, " data clusters"), u64(g.clusters))
+    assert_eq(number_after(linux.text, "Data area starts at byte "), u64(g.first_data_sector) * 512)
+
+@test("volumes made by mkfs.fat and mtools, FAT16 and FAT32, read back with their type, clusters and data area")
+reads_other_formatters()
+    need_tools()
+    val dir = make_temp_dir("fat-oracle-").unwrap()
+    val a = f"$dir/mkfs16.img"
+    assert(capture(MKFS_FAT, ["-F", "16", "-s", "4", "-C", a, "65536"], stderr = true).unwrap().status.ok())
+    read_theirs(a, FatType.Fat16, 2048)
+    val b = f"$dir/mkfs32.img"
+    assert(capture(MKFS_FAT, ["-F", "32", "-s", "1", "-C", b, "65536"], stderr = true).unwrap().status.ok())
+    read_theirs(b, FatType.Fat32, 512)
+    // mtools: FAT16 by default at this size, and a FAT32 of only 25,546 clusters when asked, which the
+    // spec would call FAT16 and which reads as FAT32 by its layout (see `parse_boot_sector`).
+    for fat32 in [false, true]
+        val c = f"$dir/mformat-$fat32.img"
+        var blank = create_image(c, 204800).unwrap()
+        blank.close()
+        val args: []const string = if fat32 then ["-i", c, "-F", "-c", "8", "::"] else ["-i", c, "-c", "8", "::"]
+        val made = capture(MFORMAT, args, stderr = true).unwrap()
+        val said = made.err.unwrap_or("")
+        if !made.status.ok() then panic(f"mformat failed: ${made.text}$said")
+        read_theirs(c, if fat32 then FatType.Fat32 else FatType.Fat16, 4096)
+    remove_dir_all(dir).unwrap()
