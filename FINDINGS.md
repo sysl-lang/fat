@@ -107,6 +107,8 @@ error: '(…)' matches a tuple, but the value is unit
 it); the reference's patterns page says nothing either way. The library writes `Ok(_)` everywhere, and
 so does `volume.sysl` meanwhile.
 
+**Status: queued for alpha.14** (alpha.13 was frozen when it arrived). `Ok(_)` stays until then.
+
 ## 5. `unit` has no `Eq`, so a `Result[unit, E]` cannot be compared (gap)
 
 ```sysl
@@ -121,3 +123,5 @@ error: '==' between sysl.Result[unit, string] needs 'sysl.Eq' — the 'impl' tha
 
 The same refusal comes from `assert_eq(v.find("missing", &e), Err(FsError.NotFound))`. `unit` has one
 value, so its `Eq` is `true`. The tests compare `.err()` (an `Option[FsError]`) meanwhile.
+
+**Status: queued for alpha.14**, with finding 4. The `.err()` comparisons stay until then.
