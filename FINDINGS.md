@@ -85,3 +85,39 @@ where a device belongs anyway.
 
 **Status: accepted for alpha.13** — given to the root-storage work (sysl branch `root-storage`) with this
 reduction as a test under both `sysl build` and `build-c`, and the reasonless overload refusal with it.
+
+## 4. `()` is not a pattern, so `Ok(())` cannot be matched (gap)
+
+Opening a directory by path answers the root when the path names no entry, so `open_dir` matches on
+what `find` (a `Result[unit, FsError]`) answered:
+
+```sysl
+check(n: int) -> Result[unit, string] = if n > 0 then Ok(()) else Err("negative")
+
+check(1) match
+    Ok(()) -> print("ok")
+    Err(e) -> print(e)
+```
+
+```
+error: '(…)' matches a tuple, but the value is unit
+```
+
+`()` builds the unit value, so it reads as the pattern for it too (Rust, Swift and OCaml all accept
+it); the reference's patterns page says nothing either way. The library writes `Ok(_)` everywhere, and
+so does `volume.sysl` meanwhile.
+
+## 5. `unit` has no `Eq`, so a `Result[unit, E]` cannot be compared (gap)
+
+```sysl
+check(n: int) -> Result[unit, string] = if n > 0 then Ok(()) else Err("negative")
+
+print(check(-1) == Err("negative"))
+```
+
+```
+error: '==' between sysl.Result[unit, string] needs 'sysl.Eq' — the 'impl' that covers it asks 'sysl.Eq' of unit, which does not implement it
+```
+
+The same refusal comes from `assert_eq(v.find("missing", &e), Err(FsError.NotFound))`. `unit` has one
+value, so its `Eq` is `true`. The tests compare `.err()` (an `Option[FsError]`) meanwhile.

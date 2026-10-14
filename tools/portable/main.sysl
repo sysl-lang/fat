@@ -1,8 +1,8 @@
-// Formats a volume over a device in static memory and reads it back: the whole package, instantiated
-// with no operating system underneath.
+// Formats a volume over a device in static memory, then mounts it, lists its root and reads a file: the
+// whole package, instantiated with no operating system underneath.
 
 import device.StaticDevice
-import sh.sysl.fat.{FatType, format, read_geometry}
+import sh.sysl.fat.{FatType, empty_entry, format, mount}
 
 @export("main")
 probe() -> i32
@@ -10,6 +10,18 @@ probe() -> i32
     val made = format(&dev, Some(FatType.Fat16), label = "PROBE")
     if made.is_err() then return 1
     var scratch: [512]u8 = [0; 512]
-    read_geometry(&dev, scratch[..]) match
-        Ok(g) -> i32(g.clusters & 0xFF)
-        Err(_) -> 2
+    var v = mount(&dev, scratch[..]) match
+        Ok(v) -> v
+        Err(_) -> return 2
+    var d = v.root()
+    var e = empty_entry()
+    var listed = 0
+    while v.read_dir(&d, &e) == Ok(true)
+        listed += 1
+    var f = v.open("/boot/kernel.img") match
+        Ok(f) -> f
+        Err(_) -> return i32(listed)
+    var out: [64]u8 = [0; 64]
+    v.read(&f, out[..]) match
+        Ok(n) -> i32(n)
+        Err(_) -> 3

@@ -1,0 +1,102 @@
+module sh.sysl.fat
+
+import sysl.encode_utf8
+import sysl.text.Ascii
+
+// The two kinds of name a directory entry has, turned into UTF-8: an 8.3 short name, whose bytes are in
+// the volume's OEM code page, and a long name, which is UTF-16 spread over a run of long-name entries.
+
+// The most UTF-16 units a run of long-name entries holds: twenty entries of thirteen. The spec allows a
+// name of 255 characters; a longer run is read as far as it goes rather than refused.
+const MAX_NAME_UNITS: usize = 260
+
+// The most UTF-8 bytes such a name can take: three per unit (a surrogate pair is two units and four
+// bytes).
+const MAX_NAME_BYTES: usize = 780
+
+// The checksum of an 8.3 name that every long-name entry before it carries, so a long name left behind
+// by a reader that knows nothing of them is recognised as no longer belonging to its short entry.
+short_name_checksum(name: [11]u8) -> u8
+    var sum = 0u8
+    for b in name
+        sum = ((sum & 1) << 7) + (sum >> 1) + b
+    sum
+
+// Code page 437, the OEM code page of the PCs FAT was written for and the one Linux, mtools and
+// dosfstools read short names in unless told otherwise: the characters of bytes 0x80-0xFF. The bytes
+// below are ASCII.
+val CP437_HIGH: [128]u16 = [
+    0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7,
+    0x00EA, 0x00EB, 0x00E8, 0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5,
+    0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9,
+    0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192,
+    0x00E1, 0x00ED, 0x00F3, 0x00FA, 0x00F1, 0x00D1, 0x00AA, 0x00BA,
+    0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+    0x2555, 0x2563, 0x2551, 0x2557, 0x255D, 0x255C, 0x255B, 0x2510,
+    0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F,
+    0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567,
+    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256B,
+    0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+    0x03B1, 0x00DF, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x00B5, 0x03C4,
+    0x03A6, 0x0398, 0x03A9, 0x03B4, 0x221E, 0x03C6, 0x03B5, 0x2229,
+    0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248,
+    0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0,
+]
+
+// The character a short name's byte stands for.
+private oem_char(b: u8) -> char = if b < 0x80 then char(u32(b)) else char(u32(CP437_HIGH[usize(b - 0x80)]))
+
+// Append `c` to `out` at `len`, answering the new length.
+private put(out: []u8, len: usize, c: char) -> usize = len + encode_utf8(c, out[len..<len + 4])
+
+// The name an 8.3 entry shows, in UTF-8, into `out` (at least 48 bytes: eleven characters of at most
+// four bytes, and the dot): the base and extension with their padding taken off and a dot between them
+// when there is an extension, each lowered where `case_bits` (the entry's `nt_reserved`) says so.
+// Answers the length.
+short_display(name: [11]u8, case_bits: u8, out: []u8) -> usize
+    var len = 0usize
+    var base_end = 8usize
+    while base_end > 0 && name[base_end - 1] == u8(' ')
+        base_end -= 1
+    var ext_end = 11usize
+    while ext_end > 8 && name[ext_end - 1] == u8(' ')
+        ext_end -= 1
+    for i in 0..<base_end
+        // A name that really begins with 0xE5 keeps 0x05 there, since 0xE5 marks a free entry.
+        var b = if i == 0 && name[0] == ENTRY_E5 then ENTRY_FREE else name[i]
+        if case_bits & LOWER_BASE != 0 then b = b.to_lower()
+        len = put(out, len, oem_char(b))
+    if ext_end > 8
+        len = put(out, len, '.')
+        for i in 8..<ext_end
+            val b = if case_bits & LOWER_EXT != 0 then name[i].to_lower() else name[i]
+            len = put(out, len, oem_char(b))
+    len
+
+// `units` (UTF-16) into `out` as UTF-8 (at least three bytes a unit), up to the first NUL unit, which
+// ends a name shorter than its entries. A surrogate without its partner is U+FFFD, the replacement
+// character. Answers the length.
+utf16_to_utf8(units: []const u16, out: []u8) -> usize
+    var len = 0usize
+    var i = 0usize
+    while i < units.len && units[i] != 0
+        val u = u32(units[i])
+        i += 1
+        if u >= 0xD800 && u < 0xDC00 && i < units.len && units[i] >= 0xDC00 && units[i] < 0xE000
+            val low = u32(units[i])
+            i += 1
+            len = put(out, len, char(0x10000 + ((u - 0xD800) << 10) + (low - 0xDC00)))
+        else if u >= 0xD800 && u < 0xE000
+            len = put(out, len, '\u{FFFD}')
+        else
+            len = put(out, len, char(u))
+    len
+
+// Whether two names are the same name on a FAT volume: equal but for the case of ASCII letters. This is
+// what Linux's vfat does with UTF-8 names; letters beyond ASCII must match exactly.
+same_name(a: []const u8, b: string) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i].to_upper() != b[i].to_upper() then return false
+    true

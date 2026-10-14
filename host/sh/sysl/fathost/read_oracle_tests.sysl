@@ -1,0 +1,177 @@
+module sh.sysl.fathost
+@tests
+@requires(os)
+
+import sh.sysl.fat.{Dir, FatType, File, Volume, empty_entry, format, mount}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_temp_dir, remove_dir_all, write_bytes}
+import sysl.process.{Var, capture}
+import sysl.testing.skip
+
+// Reading against mtools, which writes files and directories with long names into a volume the way
+// DOS and Windows lay them out: every file it copied in must read back byte for byte, and every
+// directory must list exactly the names it was given.
+
+val MCOPY: string = "/opt/homebrew/bin/mcopy"
+val MMD: string = "/opt/homebrew/bin/mmd"
+val MFORMAT_TOOL: string = "/opt/homebrew/bin/mformat"
+
+private need_mtools()
+    for tool in [MCOPY, MMD, MFORMAT_TOOL]
+        if !exists(tool) then skip(f"$tool is not installed (brew install mtools)")
+
+// mtools reads names from its arguments in the locale's character set, and checks a volume's
+// geometry against a disk's unless told not to.
+private mtool(tool: string, args: []const string)
+    val env: []const Var = [Var("MTOOLS_SKIP_CHECK", "1"), Var("LC_ALL", "en_US.UTF-8")]
+    val r = capture(tool, args, env = env, stderr = true).unwrap()
+    if !r.status.ok()
+        val said = r.err.unwrap_or("")
+        panic(f"$tool failed: ${r.text}$said")
+
+private content(n: usize, seed: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((i * 13 + seed * 7 + i / 251) % 256))
+    out
+
+// A file to copy in: its name on the volume and its size. Its bytes are `content(size, seed)`.
+struct Sample
+    name: string
+    size: usize
+    seed: usize
+
+private val SAMPLES: [9]Sample = [
+    Sample("empty", 0, 1),
+    Sample("a", 1, 2),
+    Sample("Long name with spaces.txt", 511, 3),
+    Sample("README.TXT", 512, 4),
+    Sample("lower.txt", 513, 5),
+    Sample("MiXeD.Txt", 100, 6),
+    Sample("naïve café.bin", 4096, 7),
+    Sample("日本語のファイル名.dat", 65537, 8),
+    Sample("Ελληνικά — μεγάλο αρχείο", 300000, 9),
+]
+
+// No name past U+FFFF: mtools keeps only the low sixteen bits of such a character (it writes U+1F600 as
+// the one unit 0xF600, and lists it so itself), so a surrogate pair is tested in the package instead.
+
+// The 60 files of `/many`, enough long names to run its directory over several clusters.
+private many_name(k: usize) -> string = f"file number $k with a long name.txt"
+
+// Copy every sample into the root and into `/docs/deep/er`, and sixty more into `/many`.
+private fill(dir: string, image: string)
+    mtool(MMD, ["-i", image, "::/docs", "::/docs/deep", "::/docs/deep/er", "::/many"])
+    for s in SAMPLES
+        val local = f"$dir/src-${s.seed}"
+        write_bytes(local, content(s.size, s.seed).view()).unwrap()
+        mtool(MCOPY, ["-i", image, local, f"::/${s.name}"])
+        mtool(MCOPY, ["-i", image, local, f"::/docs/deep/er/${s.name}"])
+    for k in 0usize..<60
+        val local = f"$dir/many-$k"
+        write_bytes(local, content(k * 37, k).view()).unwrap()
+        mtool(MCOPY, ["-i", image, local, f"::/many/${many_name(k)}"])
+
+private read_all(v: *Volume[ImageDevice], f: *File) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var piece: Buf[u8] = buf()
+    for _ in 0..<3000
+        piece.push(0)
+    loop
+        val n = v.read(f, piece.view()).unwrap()
+        if n == 0 then break
+        out.extend(piece.view()[0..<n])
+    out
+
+private same(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// Every name `d` lists, but `.` and `..`.
+private listing(v: *Volume[ImageDevice], d: Dir) -> Buf[string]
+    var dir = d
+    var e = empty_entry()
+    var out: Buf[string] = buf()
+    while v.read_dir(&dir, &e).unwrap()
+        if e.name() != "." && e.name() != ".." then out.push(e.name().copy())
+    out
+
+private lists_exactly(got: Buf[string], want: []const string)
+    if got.len() != want.len then panic(f"listed ${got.len()} names, wanted ${want.len}")
+    for w in want
+        var found = 0
+        for g in got.view()
+            if g == w then found += 1
+        if found != 1 then panic(f"'$w' listed $found times")
+
+// Read back everything `fill` wrote.
+private check(image: string, sector_size: usize = 512)
+    var dev = open_image(image, sector_size).unwrap()
+    var scratch: Buf[u8] = buf()
+    for _ in 0..<sector_size
+        scratch.push(0)
+    var v = mount(&dev, scratch.view()).unwrap()
+
+    var names: Buf[string] = buf()
+    for s in SAMPLES
+        names.push(s.name)
+    var root_names: Buf[string] = buf()
+    root_names.extend(names.view())
+    root_names.push("docs")
+    root_names.push("many")
+    lists_exactly(listing(&v, v.root()), root_names.view())
+    lists_exactly(listing(&v, v.open_dir("/docs/deep/er").unwrap()), names.view())
+
+    for s in SAMPLES
+        for at in [f"/${s.name}", f"docs/deep/er/${s.name}", f"/docs/../docs/deep/./er/${s.name}"]
+            var f = v.open(at).unwrap()
+            assert_eq(f.size, u32(s.size))
+            if !same(read_all(&v, &f).view(), content(s.size, s.seed).view()) then panic(f"$at differs")
+
+    var many: Buf[string] = buf()
+    for k in 0usize..<60
+        many.push(many_name(k))
+    lists_exactly(listing(&v, v.open_dir("many").unwrap()), many.view())
+    for k in 0usize..<60
+        var f = v.open(f"many/${many_name(k)}").unwrap()
+        if !same(read_all(&v, &f).view(), content(k * 37, k).view()) then panic(f"many/$k differs")
+    dev.close()
+
+private ours(dir: string, name: string, sectors: u64, kind: Option[FatType], sector_size: usize = 512) -> string
+    val image = f"$dir/$name.img"
+    var dev = create_image(image, sectors, sector_size).unwrap()
+    format(&dev, kind, label = "READ").unwrap()
+    dev.close()
+    image
+
+@test("files and directories mtools writes into our FAT16 volume read back byte for byte, long names included")
+mtools_into_fat16()
+    need_mtools()
+    val dir = make_temp_dir("fat-read-").unwrap()
+    val image = ours(dir, "fat16", 204800, Some(FatType.Fat16))
+    fill(dir, image)
+    check(image)
+    remove_dir_all(dir).unwrap()
+
+@test("files and directories mtools writes into our FAT32 volume read back byte for byte, long names included")
+mtools_into_fat32()
+    need_mtools()
+    val dir = make_temp_dir("fat-read-").unwrap()
+    val image = ours(dir, "fat32", 532481, Some(FatType.Fat32))
+    fill(dir, image)
+    check(image)
+    remove_dir_all(dir).unwrap()
+
+@test("a FAT32 volume mtools formatted and filled reads back byte for byte")
+mtools_own_fat32()
+    need_mtools()
+    val dir = make_temp_dir("fat-read-").unwrap()
+    val image = f"$dir/mformat.img"
+    var blank = create_image(image, 204800).unwrap()
+    blank.close()
+    mtool(MFORMAT_TOOL, ["-i", image, "-F", "-c", "1", "::"])
+    fill(dir, image)
+    check(image)
+    remove_dir_all(dir).unwrap()

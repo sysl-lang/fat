@@ -1,9 +1,9 @@
 # fat
 
-FAT16 and FAT32 in [sysl](https://github.com/sysl-lang/sysl): the on-disk format and a formatter today,
-reading and writing files next (see [ROADMAP.md](ROADMAP.md)). The package needs no operating system,
-allocator or float, so the same source runs in a kernel, on a microcontroller with an SD card, and on
-the host.
+FAT16 and FAT32 in [sysl](https://github.com/sysl-lang/sysl): a formatter, and reading — directories,
+long names and files — today; writing next (see [ROADMAP.md](ROADMAP.md)). The package needs no
+operating system, allocator or float, so the same source runs in a kernel, on a microcontroller with an
+SD card, and on the host.
 
 ```hocon
 dependencies {
@@ -16,6 +16,26 @@ import sh.sysl.fat.format
 
 val g = format(&card, label = "CAMERA")?      // FAT16 up to 512 MiB, FAT32 above
 ```
+
+Reading allocates nothing: the volume reads through one sector the caller hands it, and a file's data
+goes straight into the caller's buffer.
+
+```sysl
+import sh.sysl.fat.{empty_entry, mount}
+
+var sector: [512]u8 = [0; 512]
+var v = mount(&card, sector[..])?
+
+var d = v.open_dir("/photos")?
+var e = empty_entry()
+while v.read_dir(&d, &e)?
+    print(e.name(), e.size)               // long names, as UTF-8
+
+var f = v.open("/photos/Summer holiday.jpg")?
+val n = v.read(&f, out)?
+```
+
+Names match as Linux matches them: equal but for the case of ASCII letters, by long name or 8.3 name.
 
 Everything is written against a block-device trait — whole sectors by number, and a flush — so an SD
 driver, a virtio disk or an image file is just an implementation:
@@ -44,6 +64,7 @@ own tables. FAT12 is not written.
 
 `sh scripts/gate.sh`: the package's tests, the host's tests — which check every volume against macOS's
 `fsck_msdos` and dosfstools' `fsck.fat` (`brew install dosfstools mtools`), comparing fsck.fat's account
-of the geometry number for number — the package built for five freestanding targets, and the tool.
+of the geometry number for number, and read back byte for byte every file and directory mtools writes
+into our volumes and its own — the package built for five freestanding targets, and the tool.
 
 ISC licence.

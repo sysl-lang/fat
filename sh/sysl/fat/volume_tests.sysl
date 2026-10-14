@@ -1,0 +1,534 @@
+module sh.sysl.fat
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// Reading, over volumes this package formats and then lays files and directories into by hand: the
+// entries, long-name runs and FAT chains below are written field by field, so each case — a run cut
+// short, a chain that loops, a FAT32 cluster past 16 bits — is exactly the bytes the test says. The
+// host's tests read what mtools writes.
+
+private zeros(n: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for _ in 0..<n
+        out.push(0)
+    out
+
+private sector_copy(dev: *RamDevice, s: u64) -> Buf[u8]
+    var out = zeros(dev.sector_size())
+    dev.read(s, out.view()).unwrap()
+    out
+
+// Where entry `i` of a directory laid out contiguously from sector `base` is: its sector and offset.
+private slot(dev: *RamDevice, base: u32, i: u32) -> (u64, usize)
+    val per = u32(dev.sector_size() / 32)
+    (u64(base + i / per), usize(i % per) * 32)
+
+private put_short(dev: *RamDevice, base: u32, i: u32, name: string, attributes: u8, cluster: u32, size: u32,
+                  case_bits: u8 = 0)
+    val (s, off) = slot(dev, base, i)
+    var b = sector_copy(dev, s)
+    val e: *DirEntry = at(b.view(), off)
+    var n: [11]u8 = [0; 11]
+    for k in 0usize..<11
+        n[k] = name[k]
+    e.name = n
+    e.attributes = attributes
+    e.nt_reserved = case_bits
+    e.first_cluster_high = u16(cluster >> 16)
+    e.first_cluster_low = u16(cluster & 0xFFFF)
+    e.size = size
+    e.written_date = 0x5A8E
+    dev.write(s, b.view()).unwrap()
+
+// Mark entry `i` free.
+private put_free(dev: *RamDevice, base: u32, i: u32)
+    put_short(dev, base, i, "?GONE   TXT", ATTR_ARCHIVE, 0, 0)
+    val (s, off) = slot(dev, base, i)
+    var b = sector_copy(dev, s)
+    b.view()[off] = ENTRY_FREE
+    dev.write(s, b.view()).unwrap()
+
+// Piece `order` of the long name `units`, at entry `i`: thirteen units, the name's NUL after its last
+// one and 0xFFFF padding after that.
+private put_piece(dev: *RamDevice, base: u32, i: u32, units: []const u16, order: usize, last: bool, checksum: u8)
+    val (s, off) = slot(dev, base, i)
+    var b = sector_copy(dev, s)
+    val l: *LongNameEntry = at(b.view(), off)
+    var piece: [13]u16 = [0xFFFF; 13]
+    for k in 0usize..<13
+        val at_unit = (order - 1) * 13 + k
+        if at_unit < units.len then piece[k] = units[at_unit]
+        else if at_unit == units.len then piece[k] = 0
+    l.order = u8(order) | (if last then LAST_LONG_ENTRY else 0)
+    l.name1 = [Utf16Unit(piece[0]), Utf16Unit(piece[1]), Utf16Unit(piece[2]), Utf16Unit(piece[3]), Utf16Unit(piece[4])]
+    l.attributes = ATTR_LONG_NAME
+    l.kind = 0
+    l.checksum = checksum
+    l.name2 = [Utf16Unit(piece[5]), Utf16Unit(piece[6]), Utf16Unit(piece[7]), Utf16Unit(piece[8]), Utf16Unit(piece[9]),
+               Utf16Unit(piece[10])]
+    l.first_cluster_low = 0
+    l.name3 = [Utf16Unit(piece[11]), Utf16Unit(piece[12])]
+    dev.write(s, b.view()).unwrap()
+
+private pieces_of(units: []const u16) -> usize = (units.len + 12) / 13
+
+// The whole run for `units` from entry `i`, last piece first, with the checksum of `short`; answers
+// the entry after it.
+private put_long(dev: *RamDevice, base: u32, i: u32, units: []const u16, short: string) -> u32
+    val count = pieces_of(units)
+    for p in 0..<count
+        put_piece(dev, base, i + u32(p), units, count - p, p == 0, checksum_of(short))
+    i + u32(count)
+
+private checksum_of(short: string) -> u8
+    var n: [11]u8 = [0; 11]
+    for k in 0usize..<11
+        n[k] = short[k]
+    short_name_checksum(n)
+
+private ascii_units(s: string) -> Buf[u16]
+    var out: Buf[u16] = buf()
+    for i in 0..<s.len
+        out.push(u16(s[i]))
+    out
+
+// Entry `c` of every FAT copy.
+private set_fat(dev: *RamDevice, g: Geometry, c: u32, value: u32)
+    val width = if g.fat_type == FatType.Fat32 then 4u32 else 2u32
+    for n in 0..<g.fat_count
+        val offset = c * width
+        val s = u64(g.fat_start(n) + offset / g.bytes_per_sector)
+        var b = sector_copy(dev, s)
+        val at_byte = usize(offset % g.bytes_per_sector)
+        for k in 0..<usize(width)
+            b.view()[at_byte + k] = u8((value >> u32(8 * k)) & 0xFF)
+        dev.write(s, b.view()).unwrap()
+
+private end_of_chain(g: Geometry) -> u32 = if g.fat_type == FatType.Fat32 then 0x0FFF_FFFF else 0xFFFF
+
+// Link `chain` in the FAT and write `data` across its clusters.
+private put_chain(dev: *RamDevice, g: Geometry, chain: []const u32, data: []const u8)
+    for k in 0..<chain.len
+        set_fat(dev, g, chain[k], if k + 1 < chain.len then chain[k + 1] else end_of_chain(g))
+    val bps = usize(g.bytes_per_sector)
+    var at_byte = 0usize
+    for c in chain
+        for s in 0..<g.sectors_per_cluster
+            var b = zeros(bps)
+            for k in 0..<bps
+                if at_byte < data.len
+                    b.view()[k] = data[at_byte]
+                    at_byte += 1
+            dev.write(u64(g.cluster_start(c) + s), b.view()).unwrap()
+
+private pattern(n: usize, seed: usize = 3) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((i * 7 + seed) % 251))
+    out
+
+// Every byte of `f`, read `chunk` bytes at a time.
+private read_all(v: *Volume[RamDevice], f: *File, chunk: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var piece = zeros(chunk)
+    loop
+        val n = v.read(f, piece.view()).unwrap()
+        if n == 0 then break
+        out.extend(piece.view()[0..<n])
+    out
+
+private names_in(v: *Volume[RamDevice], d: Dir) -> Buf[string]
+    var dir = d
+    var e = empty_entry()
+    var out: Buf[string] = buf()
+    while v.read_dir(&dir, &e).unwrap()
+        out.push(e.name().copy())
+    out
+
+private bytes_of(s: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<s.len
+        out.push(s[i])
+    out
+
+private same_bytes(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+@test("a long name's checksum is the spec's rotate-and-add over the 8.3 name")
+checksums()
+    assert_eq(checksum_of("README  TXT"), 115)
+    assert_eq(checksum_of("LONGFI~1TXT"), 212)
+
+@test("an 8.3 name shows without its padding, with a dot only before an extension, lowered where its case bits say")
+short_names()
+    var out: [48]u8 = [0; 48]
+    val cases: [6](string, u8, string) = [
+        ("README  TXT", 0, "README.TXT"),
+        ("README  TXT", LOWER_BASE | LOWER_EXT, "readme.txt"),
+        ("README  TXT", LOWER_EXT, "README.txt"),
+        ("MAKEFILE   ", 0, "MAKEFILE"),
+        (".          ", 0, "."),
+        ("..         ", 0, ".."),
+    ]
+    for (raw, bits, want) in cases
+        var n: [11]u8 = [0; 11]
+        for k in 0usize..<11
+            n[k] = raw[k]
+        val len = short_display(n, bits, out[..])
+        assert_eq(from_utf8_unchecked(out[0..<len]), want)
+
+@test("an 8.3 name's bytes past ASCII are code page 437, and a leading 0x05 is 0xE5")
+short_names_oem()
+    var out: [48]u8 = [0; 48]
+    // 0x82 is é; 0xE5 is σ, kept as 0x05 in the first byte; 0xE1 is ß.
+    val n: [11]u8 = [0x05, u8('A'), 0x82, 0xE1, u8(' '), u8(' '), u8(' '), u8(' '), u8('T'), 0x82, u8(' ')]
+    val len = short_display(n, 0, out[..])
+    assert_eq(from_utf8_unchecked(out[0..<len]), "σAéß.Té")
+    // Lowering touches ASCII letters only.
+    val lowered = short_display(n, LOWER_BASE, out[..])
+    assert_eq(from_utf8_unchecked(out[0..<lowered]), "σaéß.Té")
+
+@test("UTF-16 becomes UTF-8 up to the NUL: a pair is one character, and a lone surrogate is U+FFFD")
+utf16()
+    var out: [64]u8 = [0; 64]
+    val good: [9]u16 = [0x006E, 0x0061, 0x00EF, 0x0076, 0x0065, 0xD83D, 0xDE00, 0x0000, 0x0041]
+    var n = utf16_to_utf8(good[..], out[..])
+    assert_eq(from_utf8_unchecked(out[0..<n]), "naïve😀")
+    val lone: [4]u16 = [0x0041, 0xD800, 0x0042, 0xDC00]
+    n = utf16_to_utf8(lone[..], out[..])
+    assert_eq(from_utf8_unchecked(out[0..<n]), "A\u{FFFD}B\u{FFFD}")
+    val wide: [2]u16 = [0x4E16, 0x754C]
+    n = utf16_to_utf8(wide[..], out[..])
+    assert_eq(from_utf8_unchecked(out[0..<n]), "世界")
+
+@test("names match without regard to the case of ASCII letters, and only of those")
+name_matching()
+    assert(same_name(bytes_of("Hello World.TXT").view(), "hello world.txt"))
+    assert(!same_name(bytes_of("hello").view(), "hello."))
+    assert(!same_name(bytes_of("café").view(), "CAFÉ"))
+    assert(same_name(bytes_of("café").view(), "CAFé"))
+
+// A FAT16 volume of 1 KiB clusters holding:
+//   /Hello World.txt   1500 bytes over clusters 2 and 3, a two-piece long name
+//   /sub/              short name only, shown lower case; cluster 4
+//   /sub/inner.bin     600 bytes in cluster 5
+//   /ORPHAN.TXT        behind a long name whose checksum is wrong, which is dropped
+// with a free entry between the first two, and the label first.
+private fat16_tree(dev: *RamDevice) -> Geometry
+    val g = format(dev, label = "TREE").unwrap()
+    assert_eq(g.cluster_bytes(), 1024)
+    val root = g.root_dir_start()
+    val hello = ascii_units("Hello World.txt")
+    var i = put_long(dev, root, 1, hello.view(), "HELLOW~1TXT")
+    put_short(dev, root, i, "HELLOW~1TXT", ATTR_ARCHIVE, 2, 1500)
+    put_chain(dev, g, [2, 3], pattern(1500).view())
+    put_free(dev, root, i + 1)
+    put_short(dev, root, i + 2, "SUB        ", ATTR_DIRECTORY, 4, 0, case_bits = LOWER_BASE)
+    i = put_long(dev, root, i + 3, ascii_units("orphan.txt").view(), "SOMEONEETXT")
+    put_short(dev, root, i, "ORPHAN  TXT", ATTR_ARCHIVE, 0, 0)
+
+    val sub = g.cluster_start(4)
+    put_chain(dev, g, [4], zeros(0).view())
+    put_short(dev, sub, 0, ".          ", ATTR_DIRECTORY, 4, 0)
+    put_short(dev, sub, 1, "..         ", ATTR_DIRECTORY, 0, 0)
+    put_short(dev, sub, 2, "INNER   BIN", ATTR_ARCHIVE, 5, 600, case_bits = LOWER_BASE | LOWER_EXT)
+    put_chain(dev, g, [5], pattern(600, seed = 11).view())
+    g
+
+private mounted(dev: *RamDevice, scratch: *Buf[u8]) -> Volume[RamDevice] = mount(dev, scratch.view()).unwrap()
+
+@test("a FAT16 root lists its entries in order with their long names, passing over the label and free entries")
+fat16_listing()
+    var dev = ram_device(20000)
+    fat16_tree(&dev)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    val names = names_in(&v, v.root())
+    assert_eq(names.len(), 3)
+    assert_eq(names.view()[0], "Hello World.txt")
+    assert_eq(names.view()[1], "sub")
+    // The long name before it carries another short name's checksum.
+    assert_eq(names.view()[2], "ORPHAN.TXT")
+    val inner = names_in(&v, v.open_dir("/sub").unwrap())
+    assert_eq(inner.len(), 3)
+    assert_eq(inner.view()[0], ".")
+    assert_eq(inner.view()[1], "..")
+    assert_eq(inner.view()[2], "inner.bin")
+
+@test("an entry reports its attributes, first cluster, size and dates")
+entry_fields()
+    var dev = ram_device(20000)
+    fat16_tree(&dev)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    var e = empty_entry()
+    v.find("Hello World.txt", &e).unwrap()
+    assert_eq(e.first_cluster, 2)
+    assert_eq(e.size, 1500)
+    assert_eq(e.attributes, ATTR_ARCHIVE)
+    assert(!e.is_dir())
+    assert_eq(e.written_date, 0x5A8E)
+    assert_eq(e.short_name[7], u8('1'))
+    v.find("/sub", &e).unwrap()
+    assert(e.is_dir())
+
+@test("a path matches long and 8.3 names in any ASCII case, through `.` and `..`, with or without a leading slash")
+paths()
+    var dev = ram_device(20000)
+    fat16_tree(&dev)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    var e = empty_entry()
+    for p in ["Hello World.txt", "/hello world.TXT", "HELLOW~1.TXT", "hellow~1.txt", "//./Hello World.txt",
+              "sub/../Hello World.txt", "/../../Hello World.txt"]
+        v.find(p, &e).unwrap()
+        assert_eq(e.first_cluster, 2)
+    for p in ["sub/inner.bin", "/SUB/INNER.BIN", "sub/./inner.bin", "sub/../sub/inner.bin", "sub//inner.bin/"]
+        v.find(p, &e).unwrap()
+        assert_eq(e.size, 600)
+    assert_eq(v.find("missing", &e).err(), Some(FsError.NotFound))
+    assert_eq(v.find("sub/missing", &e).err(), Some(FsError.NotFound))
+    assert_eq(v.find("Hello World.txt/x", &e).err(), Some(FsError.NotADirectory))
+    assert_eq(v.find("", &e).err(), Some(FsError.BadPath))
+    assert_eq(v.find("/./..", &e).err(), Some(FsError.BadPath))
+    // The orphaned long name is gone, and its entry is found by its 8.3 name in any case.
+    v.find("orphan.txt", &e).unwrap()
+    assert_eq(e.name(), "ORPHAN.TXT")
+
+@test("opening checks kinds: a directory is not a file, a file is not a directory, and the root is a directory")
+opening()
+    var dev = ram_device(20000)
+    fat16_tree(&dev)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    assert_eq(v.open("sub").err(), Some(FsError.IsADirectory))
+    assert_eq(v.open_dir("Hello World.txt").err(), Some(FsError.NotADirectory))
+    assert_eq(v.open("/").err(), Some(FsError.BadPath))
+    assert_eq(names_in(&v, v.open_dir("").unwrap()).len(), 3)
+    assert_eq(names_in(&v, v.open_dir("/sub/..").unwrap()).len(), 3)
+    // An empty file has no clusters and reads nothing.
+    var empty = v.open("ORPHAN.TXT").unwrap()
+    assert_eq(read_all(&v, &empty, 16).len(), 0)
+
+@test("a file reads back byte for byte across sectors and clusters, in chunks of any size")
+file_reads()
+    var dev = ram_device(20000)
+    fat16_tree(&dev)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    val want = pattern(1500)
+    for chunk in [1usize, 7, 511, 512, 513, 1024, 1500, 4096]
+        var f = v.open("Hello World.txt").unwrap()
+        assert(same_bytes(read_all(&v, &f, chunk).view(), want.view()))
+        assert_eq(f.position(), 1500)
+    var g = v.open("sub/inner.bin").unwrap()
+    assert(same_bytes(read_all(&v, &g, 100).view(), pattern(600, seed = 11).view()))
+
+@test("seeking moves the next read anywhere in the file, backwards across clusters too, and stops at the end")
+seeking()
+    var dev = ram_device(20000)
+    fat16_tree(&dev)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    val want = pattern(1500)
+    var f = v.open("Hello World.txt").unwrap()
+    var out = zeros(10)
+    for at in [1400u32, 3, 1023, 1024, 600, 1490]
+        f.seek(at)
+        assert_eq(v.read(&f, out.view()).unwrap(), 10)
+        assert(same_bytes(out.view(), want.view()[usize(at)..<usize(at) + 10]))
+    f.seek(1495)
+    assert_eq(v.read(&f, out.view()).unwrap(), 5)
+    f.seek(99999)
+    assert_eq(f.position(), 1500)
+    assert_eq(v.read(&f, out.view()).unwrap(), 0)
+
+@test("a chain shorter than its file, a free or bad cluster in it, or one past the volume is an error")
+broken_chains()
+    var dev = ram_device(20000)
+    val g = fat16_tree(&dev)
+    var scratch = zeros(512)
+    var out = zeros(2048)
+    set_fat(&dev, g, 2, 0xFFFF)
+    var v = mounted(&dev, &scratch)
+    var f = v.open("Hello World.txt").unwrap()
+    assert_eq(v.read(&f, out.view()), Err(FsError.ChainTooShort))
+    for bad in [0u32, 1, 0xFFF7, g.last_cluster() + 1]
+        set_fat(&dev, g, 2, bad)
+        var w = mounted(&dev, &scratch)
+        var h = w.open("Hello World.txt").unwrap()
+        assert_eq(w.read(&h, out.view()), Err(FsError.BadCluster))
+    // The first cluster an entry names is checked too.
+    put_short(&dev, g.root_dir_start(), 3, "HELLOW~1TXT", ATTR_ARCHIVE, g.last_cluster() + 1, 1500)
+    var u = mounted(&dev, &scratch)
+    assert_eq(u.open("Hello World.txt").err(), Some(FsError.BadCluster))
+
+@test("a directory whose chain loops is an error rather than an endless listing")
+looping_directory()
+    var dev = ram_device(20000)
+    val g = fat16_tree(&dev)
+    // Every entry of /sub's cluster is free, so reading goes on to the next cluster, which is itself.
+    for i in 0u32..<32
+        put_free(&dev, g.cluster_start(4), i)
+    set_fat(&dev, g, 4, 4)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    var d = v.open_dir("sub").unwrap()
+    var e = empty_entry()
+    assert_eq(v.read_dir(&d, &e), Err(FsError.ChainLoop))
+
+@test("a long name is dropped when a piece is missing, out of order, or carries another checksum")
+broken_long_names()
+    var dev = ram_device(20000)
+    val g = format(&dev).unwrap()
+    val root = g.root_dir_start()
+    val units = ascii_units("A name of three pieces, long.txt")
+    assert_eq(pieces_of(units.view()), 3)
+    val sum = checksum_of("ANAMEO~1TXT")
+    // Piece 2 missing.
+    put_piece(&dev, root, 0, units.view(), 3, true, sum)
+    put_piece(&dev, root, 1, units.view(), 1, false, sum)
+    put_short(&dev, root, 2, "ANAMEO~1TXT", ATTR_ARCHIVE, 0, 0)
+    // Pieces out of order.
+    put_piece(&dev, root, 3, units.view(), 3, true, sum)
+    put_piece(&dev, root, 4, units.view(), 1, false, sum)
+    put_piece(&dev, root, 5, units.view(), 2, false, sum)
+    put_short(&dev, root, 6, "ANAMEO~1TXT", ATTR_ARCHIVE, 0, 0)
+    // One piece with another checksum.
+    put_piece(&dev, root, 7, units.view(), 3, true, sum)
+    put_piece(&dev, root, 8, units.view(), 2, false, sum + 1)
+    put_piece(&dev, root, 9, units.view(), 1, false, sum)
+    put_short(&dev, root, 10, "ANAMEO~1TXT", ATTR_ARCHIVE, 0, 0)
+    // No first piece: a run must begin with the one marked last.
+    put_piece(&dev, root, 11, units.view(), 2, false, sum)
+    put_piece(&dev, root, 12, units.view(), 1, false, sum)
+    put_short(&dev, root, 13, "ANAMEO~1TXT", ATTR_ARCHIVE, 0, 0)
+    // A free entry between the run and its short entry.
+    var i = put_long(&dev, root, 14, units.view(), "ANAMEO~1TXT")
+    put_free(&dev, root, i)
+    put_short(&dev, root, i + 1, "ANAMEO~1TXT", ATTR_ARCHIVE, 0, 0)
+    // And whole, which is read.
+    i = put_long(&dev, root, i + 2, units.view(), "ANAMEO~1TXT")
+    put_short(&dev, root, i, "ANAMEO~1TXT", ATTR_ARCHIVE, 0, 0)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    val names = names_in(&v, v.root())
+    assert_eq(names.len(), 6)
+    for k in 0usize..<5
+        assert_eq(names.view()[k], "ANAMEO~1.TXT")
+    assert_eq(names.view()[5], "A name of three pieces, long.txt")
+
+@test("a long name of exactly thirteen units has no NUL, and one past 255 characters still reads")
+long_name_edges()
+    var dev = ram_device(20000)
+    val g = format(&dev).unwrap()
+    val root = g.root_dir_start()
+    var i = put_long(&dev, root, 0, ascii_units("thirteen.char").view(), "THIRTE~1CHA")
+    put_short(&dev, root, i, "THIRTE~1CHA", ATTR_ARCHIVE, 0, 0)
+    var long: Buf[u16] = buf()
+    for k in 0usize..<260
+        long.push(u16(u8('a') + u8(k % 26)))
+    i = put_long(&dev, root, i + 1, long.view(), "AAAAAA~1   ")
+    put_short(&dev, root, i, "AAAAAA~1   ", ATTR_ARCHIVE, 0, 0)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    val names = names_in(&v, v.root())
+    assert_eq(names.view()[0], "thirteen.char")
+    assert_eq(names.view()[1].len, 260)
+    assert_eq(names.view()[1][259], u8('z'))
+
+// A FAT32 volume of 512-byte clusters whose root runs over two clusters that are not next to each
+// other, with a long name split between them, and a file in a cluster past 16 bits.
+private fat32_tree(dev: *RamDevice) -> Geometry
+    val g = format(dev, Some(FatType.Fat32), label = "TREE32").unwrap()
+    assert_eq(g.cluster_bytes(), 512)
+    assert(g.clusters > 0x10100)
+    put_chain(dev, g, [2, 9], zeros(0).view())
+    val first = g.cluster_start(2)
+    for i in 0u32..<15
+        put_free(dev, first, i)
+    // Sixteen entries a cluster: piece 2 is the last of cluster 2, piece 1 the first of cluster 9.
+    val units: [16]u16 = [0x006E, 0x0061, 0x00EF, 0x0076, 0x0065, 0x0020, 0x0066, 0x0069, 0x006C, 0x0065,
+                          0x0020, 0xD83D, 0xDE00, 0x002E, 0x0074, 0x0078]
+    val sum = checksum_of("NAVEFI~1TX ")
+    put_piece(dev, first, 15, units[..], 2, true, sum)
+    val next = g.cluster_start(9)
+    put_piece(dev, next, 0, units[..], 1, false, sum)
+    put_short(dev, next, 1, "NAVEFI~1TX ", ATTR_ARCHIVE, 0x1_0010, 700)
+    put_chain(dev, g, [0x1_0010, 0x1_0002], pattern(700, seed = 5).view())
+    g
+
+@test("FAT32: a root over a broken run of clusters, a long name across them, and a cluster number past 16 bits")
+fat32_reads()
+    var dev = ram_device(70000)
+    fat32_tree(&dev)
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    val names = names_in(&v, v.root())
+    assert_eq(names.len(), 1)
+    assert_eq(names.view()[0], "naïve file 😀.tx")
+    // ASCII letters match in any case; the ï must be as stored.
+    assert_eq(v.open("NAÏVE FILE 😀.TX").err(), Some(FsError.NotFound))
+    var f = v.open("NAïVE FILE 😀.TX").unwrap()
+    assert_eq(f.first_cluster, 0x1_0010)
+    assert(same_bytes(read_all(&v, &f, 300).view(), pattern(700, seed = 5).view()))
+
+@test("FAT32 with mirroring off reads the FAT its flags name, and a FAT it does not have is refused")
+active_fat()
+    var dev = ram_device(70000)
+    val g = fat32_tree(&dev)
+    var boot = sector_copy(&dev, 0)
+    val t: *Fat32Tail = at(boot.view(), TAIL_OFFSET)
+    t.ext_flags = 0x81
+    dev.write(0, boot.view()).unwrap()
+    // FAT 0 now says the file ends after its first cluster; FAT 1 is the one in use and is whole.
+    val offset = 0x1_0010u32 * 4
+    val s = u64(g.fat_start(0) + offset / 512)
+    var b = sector_copy(&dev, s)
+    for k in 0usize..<4
+        b.view()[usize(offset % 512) + k] = 0xFF
+    dev.write(s, b.view()).unwrap()
+    var scratch = zeros(512)
+    var v = mounted(&dev, &scratch)
+    assert_eq(v.geometry.active_fat, 1)
+    var f = v.open("naïve file 😀.tx").unwrap()
+    assert_eq(read_all(&v, &f, 512).len(), 700)
+    // Mirroring on again: FAT 0 is read, and is short.
+    t.ext_flags = 0x01
+    dev.write(0, boot.view()).unwrap()
+    var w = mounted(&dev, &scratch)
+    var h = w.open("naïve file 😀.tx").unwrap()
+    var out = zeros(1024)
+    assert_eq(w.read(&h, out.view()), Err(FsError.ChainTooShort))
+    t.ext_flags = 0x82
+    dev.write(0, boot.view()).unwrap()
+    assert_eq(mount(&dev, scratch.view()).err(), Some(FsError.Boot(BootError.BadActiveFat)))
+    assert_eq(read_geometry(&dev, scratch.view()), Err(BootError.BadActiveFat))
+
+@test("mount wants one sector of the device's size, and passes on a boot sector it cannot use")
+mounting()
+    var dev = ram_device(20000)
+    var short = zeros(256)
+    var scratch = zeros(512)
+    assert_eq(mount(&dev, scratch.view()).err(), Some(FsError.Boot(BootError.NoSignature)))
+    assert_eq(mount(&dev, short.view()).err(), Some(FsError.BadBuffer))
+
+@test("4096-byte sectors: a directory and a file read the same way")
+big_sectors()
+    var dev = ram_device(16384, sector_size = 4096)
+    val g = format(&dev).unwrap()
+    val root = g.root_dir_start()
+    // With no label, the root is empty: its first entry is the directory's end.
+    val i = put_long(&dev, root, 0, ascii_units("a big sector file.dat").view(), "ABIGSE~1DAT")
+    put_short(&dev, root, i, "ABIGSE~1DAT", ATTR_ARCHIVE, 2, 10000)
+    put_chain(&dev, g, [2, 3, 4], pattern(10000).view())
+    var scratch = zeros(4096)
+    var v = mounted(&dev, &scratch)
+    var f = v.open("A BIG SECTOR FILE.DAT").unwrap()
+    assert(same_bytes(read_all(&v, &f, 5000).view(), pattern(10000).view()))

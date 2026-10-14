@@ -68,12 +68,12 @@ struct Fat32Tail
 @assert(sizeof(Fat32Tail) == 54, "the FAT32 extended BPB is 54 bytes")
 
 // Where each part begins, and the signature every boot sector ends its first 512 bytes with.
-val TAIL_OFFSET: usize = 36
-val SIGNATURE_OFFSET: usize = 510
+const TAIL_OFFSET: usize = 36
+const SIGNATURE_OFFSET: usize = 510
 val SIGNATURE: [2]u8 = [0x55, 0xAA]
 
 // The extended boot signature: it says the volume ID, label and type string after it are present.
-val EXTENDED_BOOT_SIGNATURE: u8 = 0x29
+const EXTENDED_BOOT_SIGNATURE: u8 = 0x29
 
 // A 32-byte directory entry (spec section 6).
 @packed
@@ -94,13 +94,52 @@ struct DirEntry
 
 @assert(sizeof(DirEntry) == 32, "a directory entry is 32 bytes")
 
+// One UTF-16 code unit of a long name, kept little-endian.
+@packed
+@byte_order(little)
+struct Utf16Unit
+    unit: u16
+
+// A long-name entry: thirteen UTF-16 units of a name too long or too varied for an 8.3 one, in three
+// pieces around the fields a short entry keeps at the same offsets (Microsoft's long file name
+// specification). A long name is a run of these just before its short entry, last piece first; `order`
+// numbers the pieces from 1, and the first entry of the run has `LAST_LONG_ENTRY` set in it too.
+@packed
+@byte_order(little)
+struct LongNameEntry
+    order: u8
+    name1: [5]Utf16Unit
+    attributes: u8
+    kind: u8
+    checksum: u8
+    name2: [6]Utf16Unit
+    first_cluster_low: u16
+    name3: [2]Utf16Unit
+
+@assert(sizeof(LongNameEntry) == 32, "a long-name entry is 32 bytes")
+
+// The attribute byte that marks a long-name entry, and the order bit that marks a run's first entry.
+const ATTR_LONG_NAME: u8 = 0x0F
+const LAST_LONG_ENTRY: u8 = 0x40
+
+// What the first byte of a short entry's name says when it is not the name's first character: a free
+// entry, the end of the directory, and a name that really begins with 0xE5 (which is kept as 0x05).
+const ENTRY_FREE: u8 = 0xE5
+const ENTRY_END: u8 = 0x00
+const ENTRY_E5: u8 = 0x05
+
+// The bits of `nt_reserved` that Windows NT and every later reader take to mean an 8.3 name's base or
+// extension is shown in lower case.
+const LOWER_BASE: u8 = 0x08
+const LOWER_EXT: u8 = 0x10
+
 // The attribute bits of a directory entry.
-val ATTR_READ_ONLY: u8 = 0x01
-val ATTR_HIDDEN: u8 = 0x02
-val ATTR_SYSTEM: u8 = 0x04
-val ATTR_VOLUME_ID: u8 = 0x08
-val ATTR_DIRECTORY: u8 = 0x10
-val ATTR_ARCHIVE: u8 = 0x20
+const ATTR_READ_ONLY: u8 = 0x01
+const ATTR_HIDDEN: u8 = 0x02
+const ATTR_SYSTEM: u8 = 0x04
+const ATTR_VOLUME_ID: u8 = 0x08
+const ATTR_DIRECTORY: u8 = 0x10
+const ATTR_ARCHIVE: u8 = 0x20
 
 // The FAT32 FSInfo sector (spec section 5): a hint of the free cluster count and where to look for one.
 @packed
@@ -116,9 +155,9 @@ struct FsInfo
 
 @assert(sizeof(FsInfo) == 512, "the FSInfo structure fills a 512-byte sector")
 
-val FSINFO_LEAD: u32 = 0x4161_5252
-val FSINFO_STRUCT: u32 = 0x6141_7272
-val FSINFO_TRAIL: u32 = 0xAA55_0000
+const FSINFO_LEAD: u32 = 0x4161_5252
+const FSINFO_STRUCT: u32 = 0x6141_7272
+const FSINFO_TRAIL: u32 = 0xAA55_0000
 
 // "Not known" in either of FSInfo's counts.
-val FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF
+const FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF

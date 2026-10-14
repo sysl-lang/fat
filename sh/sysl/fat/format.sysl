@@ -54,7 +54,7 @@ val FAT32_TABLE: [6]SizeRow = [
 ]
 
 // Where `format` stops choosing FAT16 by itself, in 512-byte sectors: 512 MiB.
-val FAT16_AUTO_LIMIT: u64 = 1048576
+const FAT16_AUTO_LIMIT: u64 = 1048576
 
 // The type `format` picks for a volume of `bytes` bytes when it is not told.
 automatic_type(bytes: u64) -> FatType = if bytes / 512 <= FAT16_AUTO_LIMIT then FatType.Fat16 else FatType.Fat32
@@ -137,7 +137,7 @@ plan(device_sectors: u64, sector_size: usize, fat_type: Option[FatType] = None, 
     val clusters = (total - first_data) / spc
     if fat_type_of(clusters) != kind || clusters > FAT32_MAX_CLUSTERS then return Err(FormatError.ClusterCountOutOfRange)
 
-    Ok(Geometry(kind, bps, spc, reserved, fats, fat_sectors, root_entries, root_dir_sectors, total,
+    Ok(Geometry(kind, bps, spc, reserved, fats, fat_sectors, 0, root_entries, root_dir_sectors, total,
                 first_data, clusters, if fat32 then 2 else 0, if fat32 then 1 else 0, if fat32 then 6 else 0,
                 hidden_sectors, 0xF8, volume_id, label_bytes))
 

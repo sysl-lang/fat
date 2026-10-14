@@ -2,7 +2,8 @@
 # fat's gate, run before every merge to dev:
 #
 #   1. every member's tests: the package's own, then the host's, which check its volumes against the
-#      host's FAT tools (fsck_msdos; dosfstools' fsck.fat and mkfs.fat; mtools' mformat);
+#      host's FAT tools (fsck_msdos; dosfstools' fsck.fat and mkfs.fat; mtools' mformat, and mcopy
+#      and mmd, whose files are read back);
 #   2. the package built for every freestanding CPU family through tools/portable, which instantiates
 #      its generic parts: anything that needs an operating system fails here;
 #   3. the mkfs.fat program built.

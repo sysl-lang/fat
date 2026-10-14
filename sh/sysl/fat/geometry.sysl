@@ -12,11 +12,11 @@ enum FatType derives Display
     Fat32
 
 // Fewer clusters than this is FAT12; fewer than `FAT32_MIN_CLUSTERS` is FAT16; the rest are FAT32.
-val FAT16_MIN_CLUSTERS: u32 = 4085
-val FAT32_MIN_CLUSTERS: u32 = 65525
+const FAT16_MIN_CLUSTERS: u32 = 4085
+const FAT32_MIN_CLUSTERS: u32 = 65525
 
 // The most data clusters a FAT32 volume may have: cluster numbers past 0x0FFF_FFF6 are reserved.
-val FAT32_MAX_CLUSTERS: u32 = 0x0FFF_FFF5
+const FAT32_MAX_CLUSTERS: u32 = 0x0FFF_FFF5
 
 // The type a volume of `clusters` data clusters is (spec section 3.5).
 fat_type_of(clusters: u32) -> FatType =
@@ -44,6 +44,7 @@ enum BootError derives Eq, Display
     FatTooSmall
     BadVersion
     BadRootCluster
+    BadActiveFat
     Fat12
 
 impl From[DeviceError] for BootError
@@ -57,6 +58,8 @@ struct Geometry derives Eq, Display
     reserved_sectors: u32
     fat_count: u32
     fat_sectors: u32
+    // The FAT copy that is read: 0, unless a FAT32 volume has turned mirroring off and named another.
+    active_fat: u32
     root_entries: u32
     root_dir_sectors: u32
     total_sectors: u32
@@ -148,6 +151,7 @@ parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Resu
     val entry_bytes = if kind == FatType.Fat32 then 4u64 else 2u64
     if u64(fat_sectors) * u64(bps) < (u64(clusters) + 2) * entry_bytes then return Err(BootError.FatTooSmall)
 
+    var active_fat = 0u32
     var root_cluster = 0u32
     var fs_info = 0u32
     var backup = 0u32
@@ -155,6 +159,11 @@ parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Resu
     var label: [11]u8 = [0; 11]
     if kind == FatType.Fat32
         if t32.version != 0 then return Err(BootError.BadVersion)
+        // Bit 7 of the flags turns mirroring off, and bits 0-3 then name the one FAT in use (spec
+        // section 3.3).
+        if t32.ext_flags & 0x80 != 0
+            active_fat = u32(t32.ext_flags & 0x0F)
+            if active_fat >= fats then return Err(BootError.BadActiveFat)
         root_cluster = t32.root_cluster
         if root_cluster < 2 || root_cluster > clusters + 1 then return Err(BootError.BadRootCluster)
         // A sector number outside the reserved area means there is none (Linux, dosfstools and Windows
@@ -170,6 +179,6 @@ parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Resu
             volume_id = t16.volume_id
             label = t16.label
 
-    Ok(Geometry(kind, bps, spc, reserved, fats, fat_sectors, root_entries, root_dir_sectors, total,
+    Ok(Geometry(kind, bps, spc, reserved, fats, fat_sectors, active_fat, root_entries, root_dir_sectors, total,
                 first_data, clusters, root_cluster, fs_info, backup, b.hidden_sectors, media, volume_id,
                 label))
