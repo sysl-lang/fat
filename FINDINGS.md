@@ -18,6 +18,9 @@ for _ in 0..<n
 The loop is what `sh.sysl.fat.ram_device` does, and what keel's KFS `ram_device` does too. Wanted: a
 `buf_filled(n, v)` (or `resize`).
 
+**Status: accepted for alpha.13** — `buf_filled(n, value)` in `sysl.buf` (sysl branch `bytes-fill`).
+The loop goes when alpha.13 ships.
+
 ## 2. A fixed byte array cannot be written from a string literal (gap)
 
 A boot sector holds `oem: [8]u8 = "MSWIN4.1"` and `fs_type: [8]u8 = "FAT32   "`. C writes
@@ -34,6 +37,10 @@ private text_bytes[const N: usize](s: string) -> [N]u8
 
 (`format.sysl`). Wanted: a string literal accepted where a `[N]u8` is expected when its length is `N`,
 checked at compile time.
+
+**Status: accepted for alpha.13, as asked** (the user's decision): a string literal is accepted wherever
+`[N]u8` is expected if its byte length is exactly N; a wrong length is an error naming both lengths, and
+it folds to constant data on bare metal (sysl branch `bytes-fill`). `text_bytes` goes when alpha.13 ships.
 
 ## 3. A copy through a slice of module storage is refused inside a method, in a hosted build only (bug)
 
@@ -75,3 +82,6 @@ shape of it, and the diagnostic naming no reason is worth fixing with it.
 
 Nothing is worked around: `tools/portable` keeps its device in a module of its own (`device/`), which is
 where a device belongs anyway.
+
+**Status: accepted for alpha.13** — given to the root-storage work (sysl branch `root-storage`) with this
+reduction as a test under both `sysl build` and `build-c`, and the reasonless overload refusal with it.
