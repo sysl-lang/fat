@@ -3,7 +3,7 @@ module sh.sysl.fathost
 @requires(os)
 
 import sh.sysl.fat.{Dir, FatType, File, Volume, empty_entry, format, mount}
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, buf_filled}
 import sysl.fs.{exists, make_temp_dir, remove_dir_all, write_bytes}
 import sysl.process.{Var, capture}
 import sysl.testing.skip
@@ -74,9 +74,7 @@ private fill(dir: string, image: string)
 
 private read_all(v: *Volume[ImageDevice], f: *File) -> Buf[u8]
     var out: Buf[u8] = buf()
-    var piece: Buf[u8] = buf()
-    for _ in 0..<3000
-        piece.push(0)
+    val piece: Buf[u8] = buf_filled(3000, 0)
     loop
         val n = v.read(f, piece.view()).unwrap()
         if n == 0 then break
@@ -109,9 +107,7 @@ private lists_exactly(got: Buf[string], want: []const string)
 // Read back everything `fill` wrote.
 private check(image: string, sector_size: usize = 512)
     var dev = open_image(image, sector_size).unwrap()
-    var scratch: Buf[u8] = buf()
-    for _ in 0..<sector_size
-        scratch.push(0)
+    val scratch: Buf[u8] = buf_filled(sector_size, 0)
     var v = mount(&dev, scratch.view()).unwrap()
 
     var names: Buf[string] = buf()

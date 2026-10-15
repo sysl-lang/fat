@@ -2,12 +2,10 @@ module sh.sysl.fat
 @tests
 @requires(heap)
 
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf_filled}
 
 private sector_of(dev: *RamDevice, s: u64) -> Buf[u8]
-    var out: Buf[u8] = buf()
-    for _ in 0..<dev.sector_size()
-        out.push(0)
+    var out: Buf[u8] = buf_filled(dev.sector_size(), 0)
     dev.read(s, out.view()).unwrap()
     out
 

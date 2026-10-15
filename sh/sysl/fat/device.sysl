@@ -1,6 +1,6 @@
 module sh.sysl.fat
 
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf_filled}
 import sysl.slices.copy
 
 // The block device everything in the package is written against: whole sectors, read and written by
@@ -44,10 +44,7 @@ struct RamDevice
 
 // A zero-filled device of `sectors` sectors of `sector_size` bytes.
 ram_device(sectors: u64, sector_size: usize = 512) -> RamDevice
-    var bytes: Buf[u8] = buf()
-    for _ in 0..<usize(sectors) * sector_size
-        bytes.push(0)
-    RamDevice(bytes, sector_size, sectors)
+    RamDevice(buf_filled(usize(sectors) * sector_size, 0), sector_size, sectors)
 
 impl BlockDevice for RamDevice
     sector_size(self) -> usize = self.size

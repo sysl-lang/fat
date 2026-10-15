@@ -141,20 +141,13 @@ plan(device_sectors: u64, sector_size: usize, fat_type: Option[FatType] = None, 
                 first_data, clusters, if fat32 then 2 else 0, if fat32 then 1 else 0, if fat32 then 6 else 0,
                 hidden_sectors, 0xF8, volume_id, label_bytes))
 
-// The bytes of `s` as an array of exactly `N`; `s` is `N` bytes long.
-private text_bytes[const N: usize](s: string) -> [N]u8
-    var out: [N]u8 = [0; N]
-    for i in 0..<N
-        out[i] = s[i]
-    out
-
 // The boot sector of a volume of geometry `g`, into `out` (one sector, zeroed here first).
 write_boot_sector(g: Geometry, out: []u8)
     fill(out, 0)
     val b: *BootSector = at(out, 0)
     val fat32 = g.fat_type == FatType.Fat32
     b.jump = [0xEB, if fat32 then 0x58 else 0x3C, 0x90]
-    b.oem = text_bytes[8]("MSWIN4.1")
+    b.oem = "MSWIN4.1"
     b.bytes_per_sector = u16(g.bytes_per_sector)
     b.sectors_per_cluster = u8(g.sectors_per_cluster)
     b.reserved_sectors = u16(g.reserved_sectors)
@@ -178,7 +171,7 @@ write_boot_sector(g: Geometry, out: []u8)
         t.boot_signature = EXTENDED_BOOT_SIGNATURE
         t.volume_id = g.volume_id
         t.label = g.label
-        t.fs_type = text_bytes[8]("FAT32   ")
+        t.fs_type = "FAT32   "
     else
         b.fat_size16 = u16(g.fat_sectors)
         val t: *Fat16Tail = at(out, TAIL_OFFSET)
@@ -186,7 +179,7 @@ write_boot_sector(g: Geometry, out: []u8)
         t.boot_signature = EXTENDED_BOOT_SIGNATURE
         t.volume_id = g.volume_id
         t.label = g.label
-        t.fs_type = text_bytes[8]("FAT16   ")
+        t.fs_type = "FAT16   "
     out[SIGNATURE_OFFSET] = SIGNATURE[0]
     out[SIGNATURE_OFFSET + 1] = SIGNATURE[1]
 

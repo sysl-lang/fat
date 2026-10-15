@@ -2,7 +2,7 @@ module sh.sysl.fat
 @tests
 @requires(heap)
 
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, buf_filled}
 import sysl.text.from_utf8_unchecked
 
 // Reading, over volumes this package formats and then lays files and directories into by hand: the
@@ -11,10 +11,7 @@ import sysl.text.from_utf8_unchecked
 // host's tests read what mtools writes.
 
 private zeros(n: usize) -> Buf[u8]
-    var out: Buf[u8] = buf()
-    for _ in 0..<n
-        out.push(0)
-    out
+    buf_filled(n, 0)
 
 private sector_copy(dev: *RamDevice, s: u64) -> Buf[u8]
     var out = zeros(dev.sector_size())
@@ -292,11 +289,11 @@ paths()
     for p in ["sub/inner.bin", "/SUB/INNER.BIN", "sub/./inner.bin", "sub/../sub/inner.bin", "sub//inner.bin/"]
         v.find(p, &e).unwrap()
         assert_eq(e.size, 600)
-    assert_eq(v.find("missing", &e).err(), Some(FsError.NotFound))
-    assert_eq(v.find("sub/missing", &e).err(), Some(FsError.NotFound))
-    assert_eq(v.find("Hello World.txt/x", &e).err(), Some(FsError.NotADirectory))
-    assert_eq(v.find("", &e).err(), Some(FsError.BadPath))
-    assert_eq(v.find("/./..", &e).err(), Some(FsError.BadPath))
+    assert_eq(v.find("missing", &e), Err(FsError.NotFound))
+    assert_eq(v.find("sub/missing", &e), Err(FsError.NotFound))
+    assert_eq(v.find("Hello World.txt/x", &e), Err(FsError.NotADirectory))
+    assert_eq(v.find("", &e), Err(FsError.BadPath))
+    assert_eq(v.find("/./..", &e), Err(FsError.BadPath))
     // The orphaned long name is gone, and its entry is found by its 8.3 name in any case.
     v.find("orphan.txt", &e).unwrap()
     assert_eq(e.name(), "ORPHAN.TXT")

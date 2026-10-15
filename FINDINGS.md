@@ -1,7 +1,7 @@
 # What writing fat found in sysl
 
 Each finding is what was being written, the shortest input that shows it, what happened, what should
-have, and what the package does meanwhile. Found against sysl 0.1.0-alpha.12.
+have, and what the package does meanwhile. Found against sysl 0.1.0-alpha.12; all five are fixed in 0.1.0-alpha.13.
 
 ## 1. A `Buf` cannot be made at a length, filled with a value (gap)
 
@@ -18,8 +18,9 @@ for _ in 0..<n
 The loop is what `sh.sysl.fat.ram_device` does, and what keel's KFS `ram_device` does too. Wanted: a
 `buf_filled(n, v)` (or `resize`).
 
-**Status: accepted for alpha.13** — `buf_filled(n, value)` in `sysl.buf` (sysl branch `bytes-fill`).
-The loop goes when alpha.13 ships.
+**Status: Fixed in 0.1.0-alpha.13** — `buf_filled(n, value)` in `sysl.buf`. `ram_device` and the tests'
+zero-filled scratch buffers use it; the element type comes from an annotated binding or a return type
+(`val scratch: Buf[u8] = buf_filled(512, 0)`), since a bare `0` is an `int`.
 
 ## 2. A fixed byte array cannot be written from a string literal (gap)
 
@@ -38,9 +39,10 @@ private text_bytes[const N: usize](s: string) -> [N]u8
 (`format.sysl`). Wanted: a string literal accepted where a `[N]u8` is expected when its length is `N`,
 checked at compile time.
 
-**Status: accepted for alpha.13, as asked** (the user's decision): a string literal is accepted wherever
-`[N]u8` is expected if its byte length is exactly N; a wrong length is an error naming both lengths, and
-it folds to constant data on bare metal (sysl branch `bytes-fill`). `text_bytes` goes when alpha.13 ships.
+**Status: Fixed in 0.1.0-alpha.13** — a string literal is accepted wherever `[N]u8` is expected if its
+byte length is exactly N. `text_bytes` is gone; `format.sysl` assigns the literals directly. A wrong
+length is refused (`this string literal is 9 bytes and [8]byte holds 8`), checked by hand: a compile
+error cannot be pinned from inside a package's tests.
 
 ## 3. A copy through a slice of module storage is refused inside a method, in a hosted build only (bug)
 
@@ -83,8 +85,8 @@ shape of it, and the diagnostic naming no reason is worth fixing with it.
 Nothing is worked around: `tools/portable` keeps its device in a module of its own (`device/`), which is
 where a device belongs anyway.
 
-**Status: accepted for alpha.13** — given to the root-storage work (sysl branch `root-storage`) with this
-reduction as a test under both `sysl build` and `build-c`, and the reasonless overload refusal with it.
+**Status: Fixed in 0.1.0-alpha.13** — the reduction above builds under `sysl build`. `tools/portable`
+keeps its device in `device/` regardless, since that is where a device belongs.
 
 ## 4. `()` is not a pattern, so `Ok(())` cannot be matched (gap)
 
@@ -107,7 +109,7 @@ error: '(…)' matches a tuple, but the value is unit
 it); the reference's patterns page says nothing either way. The library writes `Ok(_)` everywhere, and
 so does `volume.sysl` meanwhile.
 
-**Status: queued for alpha.14** (alpha.13 was frozen when it arrived). `Ok(_)` stays until then.
+**Status: Fixed in 0.1.0-alpha.13** — `Ok(())` matches. `Volume.open_dir` matches `find` with it.
 
 ## 5. `unit` has no `Eq`, so a `Result[unit, E]` cannot be compared (gap)
 
@@ -124,4 +126,6 @@ error: '==' between sysl.Result[unit, string] needs 'sysl.Eq' — the 'impl' tha
 The same refusal comes from `assert_eq(v.find("missing", &e), Err(FsError.NotFound))`. `unit` has one
 value, so its `Eq` is `true`. The tests compare `.err()` (an `Option[FsError]`) meanwhile.
 
-**Status: queued for alpha.14**, with finding 4. The `.err()` comparisons stay until then.
+**Status: Fixed in 0.1.0-alpha.13** — `assert_eq(v.find("missing", &e), Err(FsError.NotFound))` compiles.
+The `find` tests compare directly; the tests on `open`, `open_dir` and `mount` keep `.err()`, since their
+`Ok` types (`File`, `Dir`, `Volume`) are not comparable.

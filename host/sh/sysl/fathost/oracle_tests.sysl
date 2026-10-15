@@ -3,7 +3,7 @@ module sh.sysl.fathost
 @requires(os)
 
 import sh.sysl.fat.{FatType, Geometry, format, read_geometry}
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf_filled}
 import sysl.fs.{exists, make_temp_dir, remove_dir_all}
 import sysl.process.capture
 import sysl.testing.skip
@@ -111,9 +111,7 @@ forced_types_are_clean()
 // the cluster count fsck.fat finds there.
 private read_theirs(image: string, kind: FatType, cluster_bytes: u32)
     var dev = open_image(image).unwrap()
-    var scratch: Buf[u8] = buf()
-    for _ in 0..<512
-        scratch.push(0)
+    val scratch: Buf[u8] = buf_filled(512, 0)
     val g = read_geometry(&dev, scratch.view()).unwrap()
     dev.close()
     assert_eq(g.fat_type, kind)

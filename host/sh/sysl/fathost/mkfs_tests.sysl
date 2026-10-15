@@ -3,16 +3,14 @@ module sh.sysl.fathost
 @requires(os)
 
 import sh.sysl.fat.{FatType, Geometry, read_geometry}
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf_filled}
 import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
 
 private geometry_of(image: string, sector_size: usize = 512) -> Geometry
     var dev = open_image(image, sector_size).unwrap()
-    var scratch: Buf[u8] = buf()
-    for _ in 0..<sector_size
-        scratch.push(0)
+    val scratch: Buf[u8] = buf_filled(sector_size, 0)
     val g = read_geometry(&dev, scratch.view()).unwrap()
     dev.close()
     g

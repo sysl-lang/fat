@@ -259,7 +259,7 @@ struct Volume[D: BlockDevice]
     open_dir(*self, path: string) -> Result[Dir, FsError]
         var e = empty_entry()
         self.find(path, &e) match
-            Ok(_) -> self.open_dir_entry(&e)
+            Ok(()) -> self.open_dir_entry(&e)
             Err(FsError.BadPath) -> Ok(self.root())
             Err(other) -> Err(other)
 
