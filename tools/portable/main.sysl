@@ -1,6 +1,6 @@
 // Formats a volume over a device in static memory, then mounts it, writes a directory and a file into it,
-// lists its root and reads the file back: the whole package, instantiated with no operating system
-// underneath.
+// lists its root, reads the file back, renames and removes it: the whole package, instantiated with no
+// operating system underneath.
 
 import device.StaticDevice
 import sh.sysl.fat.{FatType, empty_entry, format, mount}
@@ -32,5 +32,6 @@ probe() -> i32
     val got = v.read(&f, out[..]) match
         Ok(n) -> i32(n)
         Err(_) -> return 6
-    if v.remove("/boot/kernel.img").is_err() || v.remove_dir("/boot").is_err() || v.flush().is_err() then return 7
+    if v.rename("/boot/kernel.img", "/boot/Kernel Image.img").is_err() then return 7
+    if v.remove("/boot/kernel image.img").is_err() || v.remove_dir("/boot").is_err() || v.flush().is_err() then return 8
     got

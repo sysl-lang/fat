@@ -14,7 +14,7 @@
 
 package {
   name    = "fat"
-  version = "0.0.1"
+  version = "0.1.0"
 }
 
 // The workspace's other members: `host` is the package on the host (a block device over an image

@@ -10,7 +10,7 @@ authors or trademark holders.*
 
 ```hocon
 dependencies {
-  fat { git = "github.com/sysl-lang/fat", version = "<the first tag>" }
+  fat { git = "github.com/sysl-lang/fat", version = "0.1.0" }
 }
 ```
 
@@ -48,6 +48,7 @@ v.make_dir("/photos/2026")?
 var f = v.create("/photos/2026/Holiday at the lake.jpg")?
 v.write(&f, jpeg)?                        // grows the file and its chain as it goes
 v.truncate(&f, 1024)?
+v.rename("/photos/2026/Holiday at the lake.jpg", "/photos/Lake.jpg")?
 v.remove("/photos/old.jpg")?
 v.remove_dir("/photos/empty")?
 v.flush()?
@@ -56,6 +57,14 @@ v.flush()?
 A name in 8.3's shape is stored as one; any other gets a run of long-name entries and a unique 8.3
 name with a numeric tail (`HOLIDA~1.JPG`), as Windows and Linux write them. Entries are stamped from a
 clock the board or kernel supplies (`v.set_clock(&rtc)`, any `Clock`), and with 1980-01-01 without one.
+
+**A power cut leaves at worst lost clusters.** The device sees the writes in the order they are made,
+and every operation orders them so that `fsck.fat -a` puts a cut volume back to how it was before the
+operation or how it is after — a cluster is made ready before anything points at it, and things are
+taken away from the top down. A rename is the one exception FAT allows no way round: cut between writing
+the new entry and freeing the old, both names hold the file and fsck keeps it under one of them, unless
+both entries are in one sector, as in a rename within a directory with room, where the one write that
+carries them makes it whole.
 
 Everything is written against a block-device trait — whole sectors by number, and a flush — so an SD
 driver, a virtio disk or an image file is just an implementation:
@@ -87,7 +96,9 @@ own tables. FAT12 is not written.
 of the geometry number for number, and read back byte for byte every file and directory mtools writes
 into our volumes and its own; and the other way round, a tree of files and directories the package
 writes — files truncated and removed along the way, a directory grown into reused clusters — must be
-clean to both checkers, with every file read back out through mtools by its long name. Then the package
+clean to both checkers, with every file read back out through mtools by its long name; and every
+operation, cut by a device that stops writing after each of its writes in turn, must be repaired by
+`fsck.fat -a` to a clean volume the package reads as the one before or the one after. Then the package
 built for five freestanding targets, writing included, and the tool.
 
 ISC licence.

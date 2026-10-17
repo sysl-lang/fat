@@ -37,7 +37,7 @@ operating system, allocator or float, and works over a block-device trait.
   the only one written; with it on, every FAT write goes to every copy.
 - **Writes go through the volume's one sector, written back when another is wanted, and nothing is
   durable until `flush`**, which also writes FAT32's FSInfo (the free count and where to look next).
-  A whole sector of file data goes straight to the device. Stage 4 orders the writes for a cut.
+  A whole sector of file data goes straight to the device, after the sector held.
 - **A free cluster is searched for from FSInfo's hint on**, wrapping round; a new cluster is made the end
   of its chain before the chain is linked to it, and a directory's new cluster is zeroed.
 - **Short names follow Microsoft's long file name specification**: a name in 8.3's shape is its own
@@ -46,6 +46,20 @@ operating system, allocator or float, and works over a block-device trait.
   dropped) and the first free numeric tail, `~1` on. A name is refused when it ends in a space or a dot,
   holds a control or one of `"*/:<>?\|`, or is longer than 255 UTF-16 units.
 - **Times come from a `Clock`** the volume is handed; without one an entry says 1980-01-01 00:00:00.
+- **The device sees the writes in the order they are made, and each operation orders them for a power
+  cut**: a cluster is ready before anything points at it (the end of its chain before it is linked, a
+  directory's zeroed before it is linked, a file's entry written last), and things are taken away from
+  the top down (an entry's size before its clusters, a short entry before its long-name entries, an
+  entry before its clusters). A cut leaves at worst clusters nothing names, a chain longer than its file,
+  or long-name entries with no short entry, and `fsck.fat -a` puts the volume back to before or after.
+- **A rename writes the new entry before freeing the old**, so a cut between leaves both names on one
+  chain, never neither; fsck.fat keeps the file under the name it reaches first and empties the other.
+  No order avoids it when the two entries are in different sectors (Linux's vfat has the same window); where they
+  share one, the single write makes the rename whole. A directory moved between directories and cut
+  there takes fsck.fat three passes (it empties the second name, then deletes its short entry, then its
+  long name). A rename onto an existing name is refused, except the entry's own (a change of case).
+- **`fsck.fat -a` salvages lost clusters as `FSCK0000.REC`** rather than freeing them, so the crash oracle
+  counts those files as fsck's, not as either volume's.
 
 ## Stages
 
@@ -54,15 +68,18 @@ operating system, allocator or float, and works over a block-device trait.
 | 1 | Format: the boot sector, FSInfo and backup, geometry checks, `mkfs.fat` choosing FAT16 or FAT32 by size | both host checkers find every size clean and fsck.fat agrees with the geometry; mkfs.fat's and mtools' volumes read back; the package builds for five freestanding targets ✅ |
 | 2 | Read: FAT chains, directories (short names, long names with their checksum), paths, files, over caller-provided sector buffers | files and directories written by mtools, long names included, read back byte for byte ✅ |
 | 3 | Write: cluster allocation (FSInfo's hint, both FATs), create, write, extend, truncate, delete, mkdir, rmdir; long names with unique short names (`~N`); times from a clock trait | both checkers find our writes clean and mtools reads every file back ✅ |
-| 4 | Rename, and writes ordered so a cut leaves at worst lost clusters, never cross-links: a crash-injection device runs every operation cut at every write | fsck.fat repairs every cut image to a volume holding either the old or the new state |
-| 5 | Consumers and release: keel mounts its `/boot` (keel ROADMAP row 21), skiff milestone 8; tag v0.1.0 | keel's boot test writes a file there that fsck.fat finds clean |
+| 4 | Rename, and writes ordered for a power cut: a device that stops writing runs every operation cut at every write | fsck.fat repairs every cut image to a clean volume holding the old or the new state — for a rename between directories, both names with the file under one ✅ |
+| 5 | Release v0.1.0 | tagged, with release notes ✅ |
+
+**Consumers** take it in their own repos: keel mounts its `/boot` (keel ROADMAP row 21) and skiff's SD
+card (milestone 8), each with a boot test that writes a file fsck.fat then finds clean.
 
 ## Layout
 
 | path | what |
 |---|---|
-| `sh/sysl/fat/` | the package (module `sh.sysl.fat`): `device` (the trait, a RAM device), `layout` (the on-disk structs), `geometry` (reading and checking a boot sector), `format`, `names` (8.3 and long names to UTF-8), `volume` (mounting, chains, directories, paths, reading files), `write` (allocation, creating, writing, truncating and removing, short names), `clock` (time stamps) |
-| `host/` | `fathost`: a block device over an image file, `mkfs.fat`'s command line, and the oracle tests |
+| `sh/sysl/fat/` | the package (module `sh.sysl.fat`): `device` (the trait, a RAM device), `layout` (the on-disk structs), `geometry` (reading and checking a boot sector), `format`, `names` (8.3 and long names to UTF-8), `volume` (mounting, chains, directories, paths, reading files), `write` (allocation, creating, writing, truncating, renaming and removing, short names, the order of writes), `clock` (time stamps) |
+| `host/` | `fathost`: a block device over an image file, `mkfs.fat`'s command line, and the oracle tests (`crash_oracle_tests` cuts every operation at every write) |
 | `tools/mkfs-fat/` | the `mkfs.fat` program |
 | `tools/portable/` | formats, mounts and reads a volume over static memory; built for each freestanding target by the gate |
 | `scripts/gate.sh` | the gate: every member's tests, the five freestanding builds, the tool |
