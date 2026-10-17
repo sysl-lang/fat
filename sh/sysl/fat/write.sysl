@@ -16,7 +16,7 @@ private const END32: u32 = 0x0FFF_FFFF
 
 // A place among a directory's 32-byte slots: a cluster of it (0 for FAT16's fixed root directory),
 // the slot within that cluster, and the clusters followed to reach it.
-struct Place
+private struct Place
     cluster: u32
     index: u32
     steps: u32
@@ -140,12 +140,12 @@ impl[D: BlockDevice] Volume[D]
     set_clock(*self, clock: *Clock)
         self.clock = Some(clock)
 
-    now(self) -> Stamp = self.clock match
+    private now(self) -> Stamp = self.clock match
         Some(c) -> c.now()
         None -> EPOCH
 
     // Take FAT32's FSInfo hint into memory, where it is valid.
-    read_fs_info(*self) -> Result[unit, FsError]
+    private[fat] read_fs_info(*self) -> Result[unit, FsError]
         val g = self.geometry
         if g.fat_type != FatType.Fat32 || g.fs_info_sector == 0 then return Ok(())
         self.load(u64(g.fs_info_sector))?
@@ -159,7 +159,7 @@ impl[D: BlockDevice] Volume[D]
 
     // Write the buffer to the sector it holds, if it has a write in it; a sector of the FAT goes to
     // every copy of the FAT while mirroring is on.
-    write_back(*self) -> Result[unit, FsError]
+    private[fat] write_back(*self) -> Result[unit, FsError]
         if !self.dirty then return Ok(())
         val g = self.geometry
         val s = self.loaded
@@ -188,7 +188,7 @@ impl[D: BlockDevice] Volume[D]
         Ok(())
 
     // Set cluster `c`'s FAT entry to `value`. FAT32's top four bits are reserved and kept as they are.
-    set_entry(*self, c: u32, value: u32) -> Result[unit, FsError]
+    private set_entry(*self, c: u32, value: u32) -> Result[unit, FsError]
         val at = self.load_entry(c)?
         val s = self.sector
         if self.geometry.fat_type == FatType.Fat32
@@ -201,16 +201,16 @@ impl[D: BlockDevice] Volume[D]
         self.dirty = true
         Ok(())
 
-    end_marker(self) -> u32 = if self.geometry.fat_type == FatType.Fat32 then END32 else END16
+    private end_marker(self) -> u32 = if self.geometry.fat_type == FatType.Fat32 then END32 else END16
 
-    count_free(*self, by: i32)
+    private count_free(*self, by: i32)
         if self.free_count != FSINFO_UNKNOWN then self.free_count = u32(i64(self.free_count) + i64(by))
         self.info_dirty = self.info_sector != 0
 
     // A free cluster, searched for from the FSInfo hint on and round to it again, made the end of a
     // chain and then linked after `prev` (0 for a new chain), so a write cut between the two leaves a
     // lost cluster rather than a chain into a free one.
-    allocate(*self, prev: u32) -> Result[u32, FsError]
+    private allocate(*self, prev: u32) -> Result[u32, FsError]
         val g = self.geometry
         val last = g.last_cluster()
         var c = if self.holds(self.next_free) then self.next_free else 2
@@ -225,7 +225,7 @@ impl[D: BlockDevice] Volume[D]
         Err(FsError.NoSpace)
 
     // Free the chain that begins at `first`.
-    free_chain(*self, first: u32) -> Result[unit, FsError]
+    private free_chain(*self, first: u32) -> Result[unit, FsError]
         var c = first
         loop
             // A chain that loops comes back to a cluster already freed, which `next_cluster` refuses.
@@ -237,7 +237,7 @@ impl[D: BlockDevice] Volume[D]
                 None -> return Ok(())
 
     // Fill cluster `c` with zeros, as a directory's new cluster must be.
-    zero_cluster(*self, c: u32) -> Result[unit, FsError]
+    private zero_cluster(*self, c: u32) -> Result[unit, FsError]
         self.write_back()?
         fill(self.sector, 0)
         val g = self.geometry
@@ -250,7 +250,7 @@ impl[D: BlockDevice] Volume[D]
 
     // The sector and offset of slot `p`, moving `p` on to the chain's next cluster where it has run off
     // the end of one; None at the directory's end, with `p` left on its last cluster.
-    locate(*self, p: *Place) -> Result[Option[(u64, usize)], FsError]
+    private locate(*self, p: *Place) -> Result[Option[(u64, usize)], FsError]
         val g = self.geometry
         val per_sector = g.bytes_per_sector / 32
         if p.cluster == 0
@@ -267,14 +267,14 @@ impl[D: BlockDevice] Volume[D]
         Ok(Some((u64(g.cluster_start(p.cluster) + p.index / per_sector), usize(p.index % per_sector) * 32)))
 
     // `locate`, for a slot that is known to be there.
-    slot(*self, p: *Place) -> Result[(u64, usize), FsError]
+    private slot(*self, p: *Place) -> Result[(u64, usize), FsError]
         self.locate(p)? match
             Some(pos) -> Ok(pos)
             None -> Err(FsError.ChainTooShort)
 
     // The place of the first run of `n` free slots in the directory that begins at cluster `first`,
     // growing the directory by a zeroed cluster where it has none. FAT16's fixed root cannot grow.
-    find_room(*self, first: u32, n: u32) -> Result[Place, FsError]
+    private find_room(*self, first: u32, n: u32) -> Result[Place, FsError]
         var p = Place(first, 0, 0)
         var start = p
         var run = 0u32
@@ -293,7 +293,7 @@ impl[D: BlockDevice] Volume[D]
                     self.zero_cluster(c)?
 
     // Whether a short entry in the directory at `first` has the 8.3 name `name`.
-    short_taken(*self, first: u32, name: [11]u8) -> Result[bool, FsError]
+    private short_taken(*self, first: u32, name: [11]u8) -> Result[bool, FsError]
         var p = Place(first, 0, 0)
         loop
             val pos = self.locate(&p)? match
@@ -308,7 +308,7 @@ impl[D: BlockDevice] Volume[D]
 
     // `basis` with the first numeric tail, `~1` on, that no short entry in the directory at `first`
     // has: the base is cut short to make room for the tail.
-    numbered(*self, first: u32, basis: [11]u8) -> Result[[11]u8, FsError]
+    private numbered(*self, first: u32, basis: [11]u8) -> Result[[11]u8, FsError]
         var base = 8usize
         while base > 0 && basis[base - 1] == u8(' ')
             base -= 1
@@ -333,7 +333,7 @@ impl[D: BlockDevice] Volume[D]
         Err(FsError.Exists)
 
     // The directory a path's last name is to go in, and that name.
-    split(*self, path: string) -> Result[(Dir, string), FsError]
+    private split(*self, path: string) -> Result[(Dir, string), FsError]
         var end = path.len
         while end > 0 && path[end - 1] == u8('/')
             end -= 1
@@ -346,7 +346,7 @@ impl[D: BlockDevice] Volume[D]
 
     // Add an entry named `name` to `parent`: a run of long-name entries where the name needs one, then
     // the short entry, every time stamp now. Answers where the short entry is.
-    add_entry(*self, parent: Dir, name: string, attributes: u8, cluster: u32) -> Result[(u64, usize), FsError]
+    private add_entry(*self, parent: Dir, name: string, attributes: u8, cluster: u32) -> Result[(u64, usize), FsError]
         var units: [MAX_NAME_UNITS]u16 = [0; MAX_NAME_UNITS]
         val count = name_units(name, units[..]) match
             Some(n) -> n
@@ -424,7 +424,7 @@ impl[D: BlockDevice] Volume[D]
         self.update_entry(f)?
         wrote
 
-    write_data(*self, f: *File, data: []const u8) -> Result[usize, FsError]
+    private write_data(*self, f: *File, data: []const u8) -> Result[usize, FsError]
         val g = self.geometry
         val bps = g.bytes_per_sector
         val cluster_bytes = g.cluster_bytes()
@@ -463,7 +463,7 @@ impl[D: BlockDevice] Volume[D]
         Ok(done)
 
     // Bring `f`'s directory entry up to date: its size, its first cluster and the time it was written.
-    update_entry(*self, f: *File) -> Result[unit, FsError]
+    private update_entry(*self, f: *File) -> Result[unit, FsError]
         if f.entry_sector == 0 then return Ok(())
         self.load(f.entry_sector)?
         val t = self.now()
@@ -505,7 +505,7 @@ impl[D: BlockDevice] Volume[D]
         Ok(())
 
     // Mark every slot of `e`'s run free, then free its clusters.
-    drop_entry(*self, e: *Entry) -> Result[unit, FsError]
+    private drop_entry(*self, e: *Entry) -> Result[unit, FsError]
         var p = Place(e.run_cluster, e.run_index, 0)
         for _ in 0..<e.run_len
             val pos = self.slot(&p)?

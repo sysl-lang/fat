@@ -155,5 +155,5 @@ volume's writing half is a block of its own in `write.sysl`, and about twenty of
 that must not be public (`allocate`, `free_chain`, `locate`, `write_back`…). The workaround would be to
 put every one of them in `Volume`'s body in `volume.sysl`, or to make them public.
 
-**Status: sent to sysl 2026-10-17.** The `write` branch drops their `private` meanwhile and does not land
-until it is fixed.
+**Status: Fixed in 0.1.6** — a member of an inherent `impl` block may be `private` or `private[m]`. The
+helpers in `write.sysl` are private again.
