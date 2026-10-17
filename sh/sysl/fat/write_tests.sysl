@@ -1,0 +1,488 @@
+module sh.sysl.fat
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.text.from_utf8_unchecked
+
+// Writing, checked through the package's own reading and through the raw image: what was written
+// reads back, the FAT copies agree, FSInfo counts what is free, freed clusters are free, and names
+// are laid down as Windows and Linux lay them down. The host's tests have both checkers and mtools
+// look at the same volumes.
+
+private zeros(n: usize) -> Buf[u8]
+    buf_filled(n, 0)
+
+private pattern(n: usize, seed: usize = 3) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((i * 7 + seed + i / 509) % 251))
+    out
+
+private same_bytes(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+private read_all(v: *Volume[RamDevice], f: *File) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var piece = zeros(700)
+    loop
+        val n = v.read(f, piece.view()).unwrap()
+        if n == 0 then break
+        out.extend(piece.view()[0..<n])
+    out
+
+// The whole of the file at `path`, opened afresh.
+private contents(v: *Volume[RamDevice], path: string) -> Buf[u8]
+    var f = v.open(path).unwrap()
+    read_all(v, &f)
+
+private names_in(v: *Volume[RamDevice], path: string) -> Buf[string]
+    var d = v.open_dir(path).unwrap()
+    var e = empty_entry()
+    var out: Buf[string] = buf()
+    while v.read_dir(&d, &e).unwrap()
+        out.push(e.name().copy())
+    out
+
+private entry_of(v: *Volume[RamDevice], path: string) -> Entry
+    var e = empty_entry()
+    v.find(path, &e).unwrap()
+    e
+
+private formatted(sectors: u64, kind: FatType) -> RamDevice
+    var dev = ram_device(sectors)
+    format(&dev, Some(kind)).unwrap()
+    dev
+
+// A FAT16 volume of 1 KiB clusters, and a FAT32 one of 512-byte clusters.
+private fat16() -> RamDevice = formatted(20000, FatType.Fat16)
+private fat32() -> RamDevice = formatted(70000, FatType.Fat32)
+
+// Cluster `c`'s entry in FAT copy `n`, read off the raw image.
+private raw_entry(dev: *RamDevice, g: Geometry, n: u32, c: u32) -> u32
+    val bytes = dev.image()
+    val wide = g.fat_type == FatType.Fat32
+    val at = usize(g.fat_start(n)) * usize(g.bytes_per_sector) + usize(c) * (if wide then 4usize else 2usize)
+    val low = u32(bytes[at]) | u32(bytes[at + 1]) << 8
+    if wide then (low | u32(bytes[at + 2]) << 16 | u32(bytes[at + 3]) << 24) & 0x0FFF_FFFF else low
+
+private free_clusters(dev: *RamDevice, g: Geometry) -> u32
+    var free = 0u32
+    for c in 2..<g.last_cluster() + 1
+        if raw_entry(dev, g, 0, c) == 0 then free += 1
+    free
+
+// Whether the two FAT copies are the same bytes.
+private fats_agree(dev: *RamDevice, g: Geometry) -> bool
+    val bytes = dev.image()
+    val size = usize(g.fat_sectors) * usize(g.bytes_per_sector)
+    val a = usize(g.fat_start(0)) * usize(g.bytes_per_sector)
+    val b = usize(g.fat_start(1)) * usize(g.bytes_per_sector)
+    same_bytes(bytes[a..<a + size], bytes[b..<b + size])
+
+private fs_info(dev: *RamDevice, g: Geometry) -> (u32, u32)
+    var s = zeros(512)
+    dev.read(u64(g.fs_info_sector), s.view()).unwrap()
+    val f: *FsInfo = at(s.view(), 0)
+    (f.free_count, f.next_free)
+
+private write_file(v: *Volume[RamDevice], path: string, data: []const u8)
+    var f = v.create(path).unwrap()
+    assert_eq(v.write(&f, data).unwrap(), data.len)
+
+@test("a file written in one piece reads back byte for byte, FAT16 and FAT32, across sectors and clusters")
+write_reads_back()
+    for kind in [FatType.Fat16, FatType.Fat32]
+        var dev = formatted(if kind == FatType.Fat16 then 20000 else 70000, kind)
+        var scratch = zeros(512)
+        var v = mount(&dev, scratch.view()).unwrap()
+        for n in [0usize, 1, 511, 512, 513, 1024, 5000, 70001]
+            val name = f"file-$n.bin"
+            write_file(&v, name, pattern(n, n).view())
+            val back = contents(&v, name)
+            if !same_bytes(back.view(), pattern(n, n).view()) then panic(f"$kind $name differs")
+            val e = entry_of(&v, name)
+            assert_eq(e.size, u32(n))
+            assert_eq(e.first_cluster == 0, n == 0)
+        v.flush().unwrap()
+        // Everything is on the device: a second mount reads it the same.
+        var again = zeros(512)
+        var w = mount(&dev, again.view()).unwrap()
+        assert(same_bytes(contents(&w, "file-70001.bin").view(), pattern(70001, 70001).view()))
+
+@test("writes in pieces append, overwrite in place after a seek, and grow the file only past its end")
+write_in_pieces()
+    var dev = fat32()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    val all = pattern(3000)
+    var f = v.create("pieces").unwrap()
+    var done = 0usize
+    for step in [1usize, 7, 504, 512, 1, 975, 1000]
+        assert_eq(v.write(&f, all.view()[done..<done + step]).unwrap(), step)
+        done += step
+    assert_eq(done, 3000)
+    assert_eq(f.size, 3000)
+    assert(same_bytes(contents(&v, "pieces").view(), all.view()))
+
+    // Overwrite bytes 500..<1700, across a cluster boundary, with another pattern.
+    val other = pattern(1200, 99)
+    f.seek(500)
+    v.write(&f, other.view()).unwrap()
+    assert_eq(f.size, 3000)
+    assert_eq(f.position(), 1700)
+    var want: Buf[u8] = buf()
+    want.extend(all.view()[0..<500])
+    want.extend(other.view())
+    want.extend(all.view()[1700..<3000])
+    assert(same_bytes(contents(&v, "pieces").view(), want.view()))
+
+    // From near the end, a write runs past it and the file grows by the difference.
+    f.seek(2900)
+    v.write(&f, other.view()[0..<300]).unwrap()
+    assert_eq(f.size, 3200)
+    assert_eq(entry_of(&v, "pieces").size, 3200)
+
+@test("every FAT write goes to both copies, and the clusters a file holds are no longer free")
+both_fats()
+    for kind in [FatType.Fat16, FatType.Fat32]
+        var dev = formatted(if kind == FatType.Fat16 then 20000 else 70000, kind)
+        val g = mount_geometry(&dev)
+        val before = free_clusters(&dev, g)
+        var scratch = zeros(512)
+        var v = mount(&dev, scratch.view()).unwrap()
+        write_file(&v, "a", pattern(10000).view())
+        v.make_dir("d").unwrap()
+        write_file(&v, "d/b", pattern(3000).view())
+        v.flush().unwrap()
+        assert(fats_agree(&dev, g))
+        val cb = g.cluster_bytes()
+        val used = (10000 + cb - 1) / cb + 1 + (3000 + cb - 1) / cb
+        assert_eq(free_clusters(&dev, g), before - used)
+
+private mount_geometry(dev: *RamDevice) -> Geometry
+    var scratch = zeros(512)
+    read_geometry(dev, scratch.view()).unwrap()
+
+@test("FAT32's FSInfo counts the free clusters and points past the last one taken, once flushed")
+fs_info_kept()
+    var dev = fat32()
+    val g = mount_geometry(&dev)
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    write_file(&v, "x", pattern(5000).view())
+    // Not before the flush.
+    assert_eq(fs_info(&dev, g).0, g.clusters - 1)
+    v.flush().unwrap()
+    val (free, next) = fs_info(&dev, g)
+    assert_eq(free, free_clusters(&dev, g))
+    assert_eq(free, g.clusters - 1 - 10)
+    assert_eq(next, 3 + 10)
+    v.remove("x").unwrap()
+    v.flush().unwrap()
+    assert_eq(fs_info(&dev, g).0, g.clusters - 1)
+
+@test("truncating frees the clusters past the new end, and to zero frees them all")
+truncate_frees()
+    var dev = fat16()
+    val g = mount_geometry(&dev)
+    val start = free_clusters(&dev, g)
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    val data = pattern(9000)
+    var f = v.create("t").unwrap()
+    v.write(&f, data.view()).unwrap()
+    v.truncate(&f, 2049).unwrap()
+    assert_eq(f.size, 2049)
+    assert_eq(f.position(), 2049)
+    v.flush().unwrap()
+    assert_eq(free_clusters(&dev, g), start - 3)
+    assert(same_bytes(contents(&v, "t").view(), data.view()[0..<2049]))
+    assert_eq(entry_of(&v, "t").size, 2049)
+    // Past the end changes nothing.
+    v.truncate(&f, 5000).unwrap()
+    assert_eq(f.size, 2049)
+    v.truncate(&f, 0).unwrap()
+    v.flush().unwrap()
+    assert_eq(free_clusters(&dev, g), start)
+    val e = entry_of(&v, "t")
+    assert_eq(e.size, 0)
+    assert_eq(e.first_cluster, 0)
+    // A truncated file is written again from a new chain.
+    v.write(&f, data.view()[0..<100]).unwrap()
+    assert(same_bytes(contents(&v, "t").view(), data.view()[0..<100]))
+
+@test("removing a file frees its clusters and every slot of its run, and the name can be made again")
+remove_file()
+    var dev = fat32()
+    val g = mount_geometry(&dev)
+    val start = free_clusters(&dev, g)
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    write_file(&v, "A long name that takes three slots.txt", pattern(1500).view())
+    val e = entry_of(&v, "a LONG name that takes three slots.TXT")
+    assert_eq(e.run_len, 4)
+    v.remove("/A long name that takes three slots.txt").unwrap()
+    assert_eq(v.open("A long name that takes three slots.txt").err(), Some(FsError.NotFound))
+    v.flush().unwrap()
+    assert_eq(free_clusters(&dev, g), start)
+    // Every slot of the run is free, and the directory lists nothing.
+    val root = usize(g.cluster_start(g.root_cluster)) * 512
+    for k in 0usize..<4
+        assert_eq(dev.image()[root + 32 * k], ENTRY_FREE)
+    assert_eq(names_in(&v, "/").len(), 0)
+    // The freed slots are taken again by the next name that fits in them.
+    write_file(&v, "again.txt", pattern(10).view())
+    assert_eq(entry_of(&v, "again.txt").sector_at, u64(g.cluster_start(g.root_cluster)))
+
+@test("a new directory has `.` naming itself and `..` naming its parent, the root as cluster 0")
+make_dir_dots()
+    for kind in [FatType.Fat16, FatType.Fat32]
+        var dev = formatted(if kind == FatType.Fat16 then 20000 else 70000, kind)
+        var scratch = zeros(512)
+        var v = mount(&dev, scratch.view()).unwrap()
+        v.make_dir("top").unwrap()
+        v.make_dir("/top/Inner Directory").unwrap()
+        val top = entry_of(&v, "top")
+        assert(top.is_dir())
+        assert_eq(top.size, 0)
+        val dot = entry_of(&v, "top/.")
+        val up = entry_of(&v, "top/..")
+        assert_eq(dot.first_cluster, top.first_cluster)
+        val inner = entry_of(&v, "top/inner directory")
+        val inner_up = entry_of(&v, "top/Inner Directory/..")
+        // `find` answers the entry a path's last name matched: `top/.` is `top` itself, and `top/..` the
+        // root's `..`-entry inside `top`.
+        assert_eq(up.first_cluster, 0)
+        assert_eq(inner_up.first_cluster, top.first_cluster)
+        assert(inner.first_cluster != top.first_cluster)
+        val listed = names_in(&v, "top/Inner Directory")
+        assert_eq(listed.len(), 2)
+        assert_eq(listed.view()[0], ".")
+        assert_eq(listed.view()[1], "..")
+        write_file(&v, "top/Inner Directory/leaf.txt", pattern(700).view())
+        assert(same_bytes(contents(&v, "/top/inner directory/../Inner Directory/leaf.txt").view(), pattern(700).view()))
+
+@test("removing a directory wants it empty, and refuses the root, `.`, `..` and a file")
+remove_dir_rules()
+    var dev = fat16()
+    val g = mount_geometry(&dev)
+    val start = free_clusters(&dev, g)
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    v.make_dir("d").unwrap()
+    v.make_dir("d/e").unwrap()
+    write_file(&v, "d/f", pattern(10).view())
+    assert_eq(v.remove_dir("d"), Err(FsError.NotEmpty))
+    assert_eq(v.remove_dir("d/f"), Err(FsError.NotADirectory))
+    assert_eq(v.remove("d/e"), Err(FsError.IsADirectory))
+    assert_eq(v.remove_dir("/"), Err(FsError.BadPath))
+    assert_eq(v.remove_dir("d/e/.."), Err(FsError.BadPath))
+    v.remove_dir("d/e").unwrap()
+    v.remove("d/f").unwrap()
+    v.remove_dir("d/").unwrap()
+    assert_eq(names_in(&v, "/").len(), 0)
+    v.flush().unwrap()
+    assert_eq(free_clusters(&dev, g), start)
+
+// The 8.3 name and the case bits of the entry at `path`, and how many slots its run takes.
+private short_of(v: *Volume[RamDevice], path: string) -> ([11]u8, u8, u32)
+    val e = entry_of(v, path)
+    var s = zeros(512)
+    v.dev.read(e.sector_at, s.view()).unwrap()
+    val raw: *DirEntry = at(s.view(), e.offset_at)
+    (raw.name, raw.nt_reserved, e.run_len)
+
+private short_is(v: *Volume[RamDevice], path: string, name: string, bits: u8, run: u32)
+    v.flush().unwrap()
+    val (got, got_bits, got_run) = short_of(v, path)
+    for k in 0usize..<11
+        if got[k] != name[k] then panic(f"$path: short name byte $k is ${got[k]}, wanted '$name'")
+    assert_eq(got_bits, bits)
+    assert_eq(got_run, run)
+
+@test("a name in 8.3's shape is its own short name, lower case by the NT bits; others get a basis name and a tail")
+basis_names()
+    var dev = fat16()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    val cases: [10]string = ["README.TXT", "lower.txt", "MiXeD.Txt", "Long File Name.txt", "Long File Name 2.txt",
+                             ".bashrc", "naïve.txt", "a.b.c", "x+y=z", "12345678.ABCD"]
+    for c in cases
+        write_file(&v, c, pattern(5).view())
+    short_is(&v, "README.TXT", "README  TXT", 0, 1)
+    short_is(&v, "lower.txt", "LOWER   TXT", LOWER_BASE | LOWER_EXT, 1)
+    short_is(&v, "MiXeD.Txt", "MIXED   TXT", 0, 2)
+    short_is(&v, "Long File Name.txt", "LONGFI~1TXT", 0, 3)
+    short_is(&v, "Long File Name 2.txt", "LONGFI~2TXT", 0, 3)
+    short_is(&v, ".bashrc", "BASHRC~1   ", 0, 2)
+    short_is(&v, "naïve.txt", "NA_VE~1 TXT", 0, 2)
+    short_is(&v, "a.b.c", "A~1     C  ", 0, 2)
+    short_is(&v, "x+y=z", "X_Y_Z~1    ", 0, 2)
+    short_is(&v, "12345678.ABCD", "123456~1ABC", 0, 2)
+    // Every name lists as it was given.
+    val listed = names_in(&v, "/")
+    assert_eq(listed.len(), 10)
+    for i in 0..<10
+        assert_eq(listed.view()[i], cases[i])
+
+@test("a name past U+FFFF is a surrogate pair in its long name, and reads back as written")
+surrogate_name()
+    var dev = fat32()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    write_file(&v, "😀 smile.txt", pattern(3).view())
+    assert_eq(names_in(&v, "/").view()[0], "😀 smile.txt")
+    assert_eq(contents(&v, "😀 SMILE.txt").len(), 3)
+
+@test("a name already there, in any case or as an 8.3 name, a name no volume holds, and a missing directory are refused")
+create_refusals()
+    var dev = fat16()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    write_file(&v, "Long File Name.txt", pattern(5).view())
+    v.make_dir("dir").unwrap()
+    assert_eq(v.create("LONG FILE NAME.TXT").err(), Some(FsError.Exists))
+    assert_eq(v.create("longfi~1.txt").err(), Some(FsError.Exists))
+    assert_eq(v.make_dir("DIR").err(), Some(FsError.Exists))
+    for bad in ["trailing.", "trailing ", "a*b", "a?b", "a:b", "a<b", "a|b", "a\"b", "a\\b", "\u{1}x", ".", ".."]
+        val got = v.create(f"dir/$bad").err()
+        if got != Some(FsError.BadName) && got != Some(FsError.BadPath) then panic(f"'$bad' was not refused")
+    var long_name: Buf[u8] = buf()
+    for _ in 0..<256
+        long_name.push(u8('n'))
+    val too_long = from_utf8_unchecked(long_name.view())
+    assert_eq(v.create(too_long).err(), Some(FsError.BadName))
+    assert_eq(v.create(too_long[0..<255]).is_ok(), true)
+    assert_eq(v.create("missing/file").err(), Some(FsError.NotFound))
+    assert_eq(v.create("Long File Name.txt/file").err(), Some(FsError.NotADirectory))
+    assert_eq(v.create("dir/").err(), Some(FsError.Exists))
+    // A refused directory leaves no cluster behind.
+    val g = v.geometry
+    v.flush().unwrap()
+    val free = free_clusters(&dev, g)
+    assert_eq(v.make_dir("dir").err(), Some(FsError.Exists))
+    v.flush().unwrap()
+    assert_eq(free_clusters(&dev, g), free)
+
+@test("a directory grows by zeroed clusters as names fill it, and FAT16's fixed root fills")
+directory_growth()
+    var dev = fat32()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    v.make_dir("many").unwrap()
+    for k in 0usize..<60
+        write_file(&v, f"many/file number $k with a long name.txt", pattern(k, k).view())
+    val listed = names_in(&v, "many")
+    assert_eq(listed.len(), 62)
+    for k in 0usize..<60
+        assert_eq(listed.view()[k + 2], f"file number $k with a long name.txt")
+        assert(same_bytes(contents(&v, f"many/file number $k with a long name.txt").view(), pattern(k, k).view()))
+
+    var small = fat16()
+    var s2 = zeros(512)
+    var w = mount(&small, s2.view()).unwrap()
+    for k in 0..<512
+        write_file(&w, f"F$k", pattern(0).view())
+    assert_eq(w.create("ONEMORE").err(), Some(FsError.RootFull))
+    assert_eq(w.make_dir("ONEMORE").err(), Some(FsError.RootFull))
+
+@test("a write that fills the volume stops there, and the file's entry says how much of it was written")
+volume_fills()
+    var dev = formatted(8500, FatType.Fat16)
+    val g = mount_geometry(&dev)
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    var f = v.create("big").unwrap()
+    val room = g.clusters * g.cluster_bytes()
+    assert_eq(v.write(&f, pattern(usize(room) + 1).view()).err(), Some(FsError.NoSpace))
+    assert_eq(f.size, room)
+    assert_eq(entry_of(&v, "big").size, room)
+    v.flush().unwrap()
+    assert_eq(free_clusters(&dev, g), 0)
+    assert_eq(v.create("small").unwrap().size, 0)
+    var s = v.open("small").unwrap()
+    assert_eq(v.write(&s, pattern(1).view()).err(), Some(FsError.NoSpace))
+    // Freeing makes room again.
+    v.remove("big").unwrap()
+    assert_eq(v.write(&s, pattern(1).view()).unwrap(), 1)
+
+@test("a directory grown into clusters a removed file's data left behind lists only its own names")
+reused_clusters_are_zeroed()
+    var dev = formatted(8500, FatType.Fat16)
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    var filler = v.create("filler").unwrap()
+    val block = pattern(4096, 5)
+    loop
+        if v.write(&filler, block.view()).is_err() then break
+    v.remove("filler").unwrap()
+    v.make_dir("d").unwrap()
+    for k in 0usize..<40
+        write_file(&v, f"d/a name long enough for two slots $k", pattern(1).view())
+    val listed = names_in(&v, "d")
+    assert_eq(listed.len(), 42)
+    for k in 0usize..<40
+        assert_eq(listed.view()[k + 2], f"a name long enough for two slots $k")
+
+@test("FAT32: a file and a directory given clusters past 16 bits keep the high half in their entries")
+clusters_past_16_bits()
+    var dev = fat32()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    v.next_free = 0x1_0005
+    v.make_dir("high").unwrap()
+    write_file(&v, "high/data.bin", pattern(2000).view())
+    val d = entry_of(&v, "high")
+    assert_eq(d.first_cluster, 0x1_0005)
+    assert_eq(entry_of(&v, "high/.").first_cluster, 0x1_0005)
+    assert_eq(entry_of(&v, "high/data.bin").first_cluster, 0x1_0006)
+    v.make_dir("high/deeper").unwrap()
+    assert_eq(entry_of(&v, "high/deeper/..").first_cluster, 0x1_0005)
+    v.flush().unwrap()
+    var again = zeros(512)
+    var w = mount(&dev, again.view()).unwrap()
+    assert(same_bytes(contents(&w, "/high/data.bin").view(), pattern(2000).view()))
+
+@test("a write past 4 GiB less one byte is refused before anything is written")
+too_large()
+    var dev = fat16()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    var f = File(0, 0xFFFF_FFF0, 0xFFFF_FFF0, 0, 0, 0, 0)
+    assert_eq(v.write(&f, pattern(16).view()).err(), Some(FsError.TooLarge))
+    assert_eq(v.write(&f, pattern(15).view()).err(), Some(FsError.NoSpace))
+
+struct FixedClock
+    t: Stamp
+
+impl Clock for FixedClock
+    now(self) -> Stamp = self.t
+
+@test("entries are stamped from the volume's clock, and with 1980-01-01 00:00:00 without one")
+stamps()
+    assert_eq(fat_stamp(2026, 10, 17, 6, 30, 15), Stamp(0x5D51, 0x33C7, 100))
+    assert_eq(fat_stamp(1970, 1, 1, 0, 0, 0).date, 0x0021)
+    var dev = fat16()
+    var scratch = zeros(512)
+    var v = mount(&dev, scratch.view()).unwrap()
+    write_file(&v, "before", pattern(1).view())
+    val e = entry_of(&v, "before")
+    assert_eq(e.created_date, 0x0021)
+    assert_eq(e.written_time, 0)
+    var clock = FixedClock(fat_stamp(2026, 10, 17, 6, 30, 15))
+    v.set_clock(&clock)
+    var f = v.create("after").unwrap()
+    val made = entry_of(&v, "after")
+    assert_eq(made.created_date, 0x5D51)
+    assert_eq(made.created_time, 0x33C7)
+    clock.t = fat_stamp(2027, 1, 2, 3, 4, 6)
+    v.write(&f, pattern(1).view()).unwrap()
+    val written = entry_of(&v, "after")
+    assert_eq(written.created_date, 0x5D51)
+    assert_eq(written.written_date, fat_stamp(2027, 1, 2, 3, 4, 6).date)
+    assert_eq(written.written_time, fat_stamp(2027, 1, 2, 3, 4, 6).time)
+    assert_eq(written.accessed_date, written.written_date)

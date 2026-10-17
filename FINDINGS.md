@@ -129,3 +129,31 @@ value, so its `Eq` is `true`. The tests compare `.err()` (an `Option[FsError]`) 
 **Status: Fixed in 0.1.0-alpha.13** — `assert_eq(v.find("missing", &e), Err(FsError.NotFound))` compiles.
 The `find` tests compare directly; the tests on `open`, `open_dir` and `mount` keep `.err()`, since their
 `Ok` types (`File`, `Dir`, `Volume`) are not comparable.
+
+## 6. A member of an `impl` block naming no trait cannot be `private` (bug)
+
+```sysl
+struct P
+    n: int
+
+impl P
+    private twice(self) -> int = self.n * 2
+    shown(self) -> int = self.twice()
+
+print(P(4).shown())
+```
+
+```
+error: a trait's members and an 'impl' block's carry no visibility of their own — a trait's member is as visible as the trait, and an implementation supplies what the trait asked for
+ --> main.sysl:5:13
+```
+
+The reference (declarations.md, "Members in an `impl` block of their own") says such a block's members
+"are the type's own exactly as the body's are", and a body's member may be `private` or `private[m]`. The
+diagnostic's reason is about a trait's implementation, which this block is not. Writing stage 3, the
+volume's writing half is a block of its own in `write.sysl`, and about twenty of its members are helpers
+that must not be public (`allocate`, `free_chain`, `locate`, `write_back`…). The workaround would be to
+put every one of them in `Volume`'s body in `volume.sysl`, or to make them public.
+
+**Status: sent to sysl 2026-10-17.** The `write` branch drops their `private` meanwhile and does not land
+until it is fixed.

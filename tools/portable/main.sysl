@@ -1,5 +1,6 @@
-// Formats a volume over a device in static memory, then mounts it, lists its root and reads a file: the
-// whole package, instantiated with no operating system underneath.
+// Formats a volume over a device in static memory, then mounts it, writes a directory and a file into it,
+// lists its root and reads the file back: the whole package, instantiated with no operating system
+// underneath.
 
 import device.StaticDevice
 import sh.sysl.fat.{FatType, empty_entry, format, mount}
@@ -13,6 +14,12 @@ probe() -> i32
     var v = mount(&dev, scratch[..]) match
         Ok(v) -> v
         Err(_) -> return 2
+    if v.make_dir("/boot").is_err() then return 3
+    var w = v.create("/boot/kernel.img") match
+        Ok(f) -> f
+        Err(_) -> return 4
+    val data: [64]u8 = [7; 64]
+    if v.write(&w, data[..]).is_err() || v.truncate(&w, 32).is_err() then return 5
     var d = v.root()
     var e = empty_entry()
     var listed = 0
@@ -22,6 +29,8 @@ probe() -> i32
         Ok(f) -> f
         Err(_) -> return i32(listed)
     var out: [64]u8 = [0; 64]
-    v.read(&f, out[..]) match
+    val got = v.read(&f, out[..]) match
         Ok(n) -> i32(n)
-        Err(_) -> 3
+        Err(_) -> return 6
+    if v.remove("/boot/kernel.img").is_err() || v.remove_dir("/boot").is_err() || v.flush().is_err() then return 7
+    got

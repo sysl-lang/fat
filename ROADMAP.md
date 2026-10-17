@@ -33,7 +33,19 @@ operating system, allocator or float, and works over a block-device trait.
 - **A long name is used only when its run is whole**: it begins with the entry marked last, each entry
   numbers one less with the same checksum, and the checksum is the short entry's. Anything else is
   dropped and the 8.3 name shown, as every reader does.
-- **FAT32's active FAT is honoured**: with mirroring off, the FAT its flags name is the one read.
+- **FAT32's active FAT is honoured**: with mirroring off, the FAT its flags name is the one read and
+  the only one written; with it on, every FAT write goes to every copy.
+- **Writes go through the volume's one sector, written back when another is wanted, and nothing is
+  durable until `flush`**, which also writes FAT32's FSInfo (the free count and where to look next).
+  A whole sector of file data goes straight to the device. Stage 4 orders the writes for a cut.
+- **A free cluster is searched for from FSInfo's hint on**, wrapping round; a new cluster is made the end
+  of its chain before the chain is linked to it, and a directory's new cluster is zeroed.
+- **Short names follow Microsoft's long file name specification**: a name in 8.3's shape is its own
+  short name, with the NT bits where its base or extension is all lower case and a long name where either
+  is mixed; any other gets the spec's basis name (non-ASCII and `+,;=[]` as `_`, spaces and leading dots
+  dropped) and the first free numeric tail, `~1` on. A name is refused when it ends in a space or a dot,
+  holds a control or one of `"*/:<>?\|`, or is longer than 255 UTF-16 units.
+- **Times come from a `Clock`** the volume is handed; without one an entry says 1980-01-01 00:00:00.
 
 ## Stages
 
@@ -41,7 +53,7 @@ operating system, allocator or float, and works over a block-device trait.
 |---|---|---|
 | 1 | Format: the boot sector, FSInfo and backup, geometry checks, `mkfs.fat` choosing FAT16 or FAT32 by size | both host checkers find every size clean and fsck.fat agrees with the geometry; mkfs.fat's and mtools' volumes read back; the package builds for five freestanding targets ✅ |
 | 2 | Read: FAT chains, directories (short names, long names with their checksum), paths, files, over caller-provided sector buffers | files and directories written by mtools, long names included, read back byte for byte ✅ |
-| 3 | Write: cluster allocation (FSInfo's hint, both FATs), create, write, extend, truncate, delete, mkdir, rmdir; long names with unique short names (`~N`); times from a clock trait | both checkers find our writes clean and mtools reads every file back |
+| 3 | Write: cluster allocation (FSInfo's hint, both FATs), create, write, extend, truncate, delete, mkdir, rmdir; long names with unique short names (`~N`); times from a clock trait | both checkers find our writes clean and mtools reads every file back ✅ |
 | 4 | Rename, and writes ordered so a cut leaves at worst lost clusters, never cross-links: a crash-injection device runs every operation cut at every write | fsck.fat repairs every cut image to a volume holding either the old or the new state |
 | 5 | Consumers and release: keel mounts its `/boot` (keel ROADMAP row 21), skiff milestone 8; tag v0.1.0 | keel's boot test writes a file there that fsck.fat finds clean |
 
@@ -49,7 +61,7 @@ operating system, allocator or float, and works over a block-device trait.
 
 | path | what |
 |---|---|
-| `sh/sysl/fat/` | the package (module `sh.sysl.fat`): `device` (the trait, a RAM device), `layout` (the on-disk structs), `geometry` (reading and checking a boot sector), `format`, `names` (8.3 and long names to UTF-8), `volume` (mounting, chains, directories, paths, files) |
+| `sh/sysl/fat/` | the package (module `sh.sysl.fat`): `device` (the trait, a RAM device), `layout` (the on-disk structs), `geometry` (reading and checking a boot sector), `format`, `names` (8.3 and long names to UTF-8), `volume` (mounting, chains, directories, paths, reading files), `write` (allocation, creating, writing, truncating and removing, short names), `clock` (time stamps) |
 | `host/` | `fathost`: a block device over an image file, `mkfs.fat`'s command line, and the oracle tests |
 | `tools/mkfs-fat/` | the `mkfs.fat` program |
 | `tools/portable/` | formats, mounts and reads a volume over static memory; built for each freestanding target by the gate |

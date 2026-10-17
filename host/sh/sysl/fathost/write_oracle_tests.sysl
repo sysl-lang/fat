@@ -1,0 +1,199 @@
+module sh.sysl.fathost
+@tests
+@requires(os)
+
+import sh.sysl.fat.{Clock, FatType, Stamp, Volume, fat_stamp, format, mount}
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.fs.{exists, make_temp_dir, read_bytes, remove_dir_all}
+import sysl.process.{Var, capture}
+import sysl.testing.skip
+import sysl.text.Search
+
+// Writing against the host's tools: a tree of files and directories written by the package — long
+// names, a directory grown over many clusters, files truncated and removed along the way — must be
+// clean to both fsck_msdos and fsck.fat, and every file must come back out byte for byte through mtools,
+// which finds each one by its long name.
+
+private need_all()
+    for tool in [FSCK_FAT, FSCK_MSDOS, MKFS_FAT, MCOPY]
+        if !exists(tool) then skip(f"$tool is not installed (brew install dosfstools mtools)")
+
+private bytes(n: usize, seed: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((i * 31 + seed * 17 + i / 509) % 256))
+    out
+
+private struct Planned
+    name: string
+    size: usize
+    seed: usize
+
+// No name past U+FFFF, which mtools cannot name (see `read_oracle_tests.sysl`).
+private val PLANNED: [9]Planned = [
+    Planned("empty", 0, 1),
+    Planned("a", 1, 2),
+    Planned("Long name with spaces.txt", 511, 3),
+    Planned("README.TXT", 512, 4),
+    Planned("lower.txt", 513, 5),
+    Planned("MiXeD.Txt", 100, 6),
+    Planned("naïve café.bin", 4096, 7),
+    Planned("日本語のファイル名.dat", 65537, 8),
+    Planned("Ελληνικά — μεγάλο αρχείο", 300000, 9),
+]
+
+private many_name(k: usize) -> string = f"file number $k with a long name.txt"
+private late_name(k: usize) -> string = f"written after the removals, number $k.txt"
+
+struct OracleClock
+    t: Stamp
+
+impl Clock for OracleClock
+    now(self) -> Stamp = self.t
+
+// Write `data` to a new file at `path`, a thousand bytes at a time.
+private put(v: *Volume[ImageDevice], path: string, data: []const u8)
+    var f = v.create(path).unwrap()
+    var done = 0usize
+    while done < data.len
+        val end = if done + 1000 < data.len then done + 1000 else data.len
+        assert_eq(v.write(&f, data[done..<end]).unwrap(), end - done)
+        done = end
+
+// The tree, written into the volume on `image`: every planned file in the root and in
+// `/docs/deep/er`, sixty more in `/many`, some written, cut short or removed again, and forty in
+// `/late`, written after the removals.
+private write_tree(image: string, sector_size: usize = 512)
+    var dev = open_image(image, sector_size).unwrap()
+    val scratch: Buf[u8] = buf_filled(sector_size, 0)
+    var v = mount(&dev, scratch.view()).unwrap()
+    var clock = OracleClock(fat_stamp(2026, 10, 17, 9, 41, 7))
+    v.set_clock(&clock)
+    v.make_dir("docs").unwrap()
+    v.make_dir("docs/deep").unwrap()
+    v.make_dir("/docs/deep/er").unwrap()
+    v.make_dir("many").unwrap()
+    v.make_dir("gone").unwrap()
+    for p in PLANNED
+        put(&v, f"/${p.name}", bytes(p.size, p.seed).view())
+        put(&v, f"docs/deep/er/${p.name}", bytes(p.size, p.seed).view())
+    for k in 0usize..<60
+        put(&v, f"many/${many_name(k)}", bytes(k * 37, k).view())
+    // Made and removed again: their clusters and slots are free for what comes after.
+    put(&v, "gone/temporary file.bin", bytes(20000, 11).view())
+    v.remove("gone/temporary file.bin").unwrap()
+    v.remove_dir("gone").unwrap()
+    for k in 0usize..<60
+        if k % 3 == 0 then v.remove(f"many/${many_name(k)}").unwrap()
+    // Cut short, to nothing and to part of a cluster.
+    var cut = v.open("docs/deep/er/日本語のファイル名.dat").unwrap()
+    v.truncate(&cut, 1500).unwrap()
+    var nothing = v.open("/README.TXT").unwrap()
+    v.truncate(&nothing, 0).unwrap()
+    // Written after the removals, into the room they left.
+    clock.t = fat_stamp(2026, 10, 18, 0, 0, 0)
+    put(&v, "after the removals.bin", bytes(9000, 12).view())
+    // A directory made after the removals: where the search for a free cluster has wrapped round, its
+    // clusters are ones a removed file's data left behind, and must have been zeroed.
+    v.make_dir("late").unwrap()
+    for k in 0usize..<40
+        put(&v, f"late/${late_name(k)}", bytes(k, k + 100).view())
+    v.flush().unwrap()
+    dev.close()
+
+// What each file should hold once `write_tree` is done: its path and bytes.
+private expected() -> Buf[(string, Buf[u8])]
+    var out: Buf[(string, Buf[u8])] = buf()
+    for p in PLANNED
+        val size = if p.name == "README.TXT" then 0 else p.size
+        out.push((f"/${p.name}", bytes(size, p.seed)))
+        var inner = bytes(p.size, p.seed)
+        if p.name == "日本語のファイル名.dat" then inner = bytes(1500, p.seed)
+        out.push((f"/docs/deep/er/${p.name}", inner))
+    for k in 0usize..<60
+        if k % 3 != 0 then out.push((f"/many/${many_name(k)}", bytes(k * 37, k)))
+    out.push(("/after the removals.bin", bytes(9000, 12)))
+    for k in 0usize..<40
+        out.push((f"/late/${late_name(k)}", bytes(k, k + 100)))
+    out
+
+private run(tool: string, args: []const string) -> (bool, string)
+    val env: []const Var = [Var("MTOOLS_SKIP_CHECK", "1"), Var("LC_ALL", "en_US.UTF-8")]
+    val r = capture(tool, args, env = env, stderr = true).unwrap()
+    (r.status.ok(), r.text + r.err.unwrap_or(""))
+
+private same(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// Both checkers find `image` clean, and every file comes back out through mtools by its long name.
+private check_tree(dir: string, image: string)
+    val (bsd_ok, bsd) = run(FSCK_MSDOS, ["-n", image])
+    if !bsd_ok then panic(f"fsck_msdos rejected the written volume:\n$bsd")
+    val (linux_ok, linux) = run(FSCK_FAT, ["-n", "-v", image])
+    if !linux_ok || linux.contains("differ") || linux.contains("wrong") then panic(f"fsck.fat rejected the written volume:\n$linux")
+    var n = 0
+    for want in expected().view()
+        val out = f"$dir/out-$n"
+        n += 1
+        val (ok, said) = run(MCOPY, ["-n", "-i", image, f"::${want.0}", out])
+        if !ok then panic(f"mcopy could not find ${want.0}: $said")
+        val got = read_bytes(out).unwrap()
+        if !same(got, want.1.view()) then panic(f"${want.0} came back as ${got.len} bytes, not the ${want.1.len()} written")
+
+@test("a tree written into our FAT16 volume is clean to both checkers, and mtools reads every file back")
+written_fat16_is_clean()
+    need_all()
+    val dir = make_temp_dir("fat-write-").unwrap()
+    val image = f"$dir/fat16.img"
+    var dev = create_image(image, 204800).unwrap()
+    format(&dev, Some(FatType.Fat16), label = "WRITTEN").unwrap()
+    dev.close()
+    write_tree(image)
+    check_tree(dir, image)
+    remove_dir_all(dir).unwrap()
+
+@test("a tree written into our FAT32 volume is clean to both checkers, and mtools reads every file back")
+written_fat32_is_clean()
+    need_all()
+    val dir = make_temp_dir("fat-write-").unwrap()
+    val image = f"$dir/fat32.img"
+    var dev = create_image(image, 532481).unwrap()
+    format(&dev, Some(FatType.Fat32)).unwrap()
+    dev.close()
+    write_tree(image)
+    check_tree(dir, image)
+    remove_dir_all(dir).unwrap()
+
+@test("a tree written after a file filled the volume and was removed is clean, so reused clusters were zeroed")
+written_after_wrapping()
+    need_all()
+    val dir = make_temp_dir("fat-write-").unwrap()
+    val image = f"$dir/wrapped.img"
+    var dev = create_image(image, 8500).unwrap()
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    val scratch: Buf[u8] = buf_filled(512, 0)
+    var v = mount(&dev, scratch.view()).unwrap()
+    var filler = v.create("filler").unwrap()
+    val block = bytes(4096, 13)
+    loop
+        if v.write(&filler, block.view()).is_err() then break
+    v.remove("filler").unwrap()
+    v.flush().unwrap()
+    dev.close()
+    write_tree(image)
+    check_tree(dir, image)
+    remove_dir_all(dir).unwrap()
+
+@test("a tree written into mkfs.fat's FAT32 volume of 4096-byte sectors is clean, and reads back through mtools")
+written_into_mkfs_fat32()
+    need_all()
+    val dir = make_temp_dir("fat-write-").unwrap()
+    val image = f"$dir/mkfs32.img"
+    val (made, said) = run(MKFS_FAT, ["-F", "32", "-S", "4096", "-s", "1", "-C", image, "300000"])
+    if !made then panic(f"mkfs.fat failed: $said")
+    write_tree(image, 4096)
+    check_tree(dir, image)
+    remove_dir_all(dir).unwrap()
