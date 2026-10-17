@@ -1,0 +1,304 @@
+module sh.sysl.fathost
+@tests
+@requires(os)
+
+import sh.sysl.fat.{BlockDevice, DeviceError, FatType, FsError, Volume, empty_entry, format, mount}
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.fs.{copy_file, exists, make_temp_dir, remove_dir_all}
+import sysl.process.{Var, capture}
+import sysl.testing.skip
+import sysl.text.Search
+
+// Every operation, cut at every write. Each operation runs once to count the sectors it writes, then
+// once for each count from none to all of them over a device that stops writing there, as a power cut
+// would stop it. `fsck.fat -a` repairs each image, both checkers must then find it clean, and the
+// package must read it back as the volume before the operation or the volume after it — never a third.
+
+private need_tools()
+    for tool in [FSCK_FAT, FSCK_MSDOS]
+        if !exists(tool) then skip(f"$tool is not installed (brew install dosfstools)")
+
+// An image device that counts its writes and, when `cutting`, makes only `left` more of them.
+struct CutImage
+    image: ImageDevice
+    writes: u32
+    left: u32
+    cutting: bool
+
+impl BlockDevice for CutImage
+    sector_size(self) -> usize = self.image.sector_size()
+    sectors(self) -> u64 = self.image.sectors()
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError] = self.image.read(s, out)
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+        if self.cutting
+            if self.left == 0 then return Err(DeviceError.Io)
+            self.left -= 1
+        self.writes += 1
+        self.image.write(s, data)
+    flush(*self) -> Result[unit, DeviceError] = self.image.flush()
+
+private enum Op derives Display
+    Create
+    Append
+    Shorten
+    Empty
+    Remove
+    MakeDir
+    RemoveDir
+    Grow
+    RenameHere
+    RenameAway
+    MoveDir
+    AppendFat32
+
+private data(n: usize, seed: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((i * 13 + seed * 29 + i / 257) % 256))
+    out
+
+private same_data(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+private write_new(v: *Volume[CutImage], path: string, n: usize, seed: usize)
+    var f = v.create(path).unwrap()
+    v.write(&f, data(n, seed).view()).unwrap()
+
+// The volume an operation starts from.
+private set_up(op: Op, v: *Volume[CutImage])
+    op match
+        Op.Append | Op.AppendFat32 -> write_new(v, "growing file.bin", 3000, 1)
+        Op.Shorten | Op.Empty -> write_new(v, "shrinking file.bin", 9000, 2)
+        Op.Remove ->
+            // Fourteen one-slot names first, so the long name's three slots straddle the root's first
+            // two sectors.
+            for k in 0..<14
+                v.create(f"f$k").unwrap()
+            write_new(v, "straddling long name.txt", 5000, 3)
+        Op.RemoveDir -> v.make_dir("old directory").unwrap()
+        Op.Grow ->
+            // A removed file's data in the clusters the free search reaches first, and a directory whose
+            // one cluster is full, so its next name needs one of them.
+            write_new(v, "junk", 20000, 4)
+            v.make_dir("full").unwrap()
+            for k in 0..<30
+                v.create(f"full/e$k").unwrap()
+            v.remove("junk").unwrap()
+        Op.RenameHere -> write_new(v, "before name.txt", 4000, 5)
+        Op.RenameAway ->
+            v.make_dir("src").unwrap()
+            v.make_dir("dst").unwrap()
+            write_new(v, "src/moving file.bin", 4000, 6)
+        Op.MoveDir ->
+            v.make_dir("src").unwrap()
+            v.make_dir("dst").unwrap()
+            v.make_dir("src/moving dir").unwrap()
+            write_new(v, "src/moving dir/inside.bin", 3000, 7)
+        _ -> ()
+
+private act(op: Op, v: *Volume[CutImage]) -> Result[unit, FsError]
+    op match
+        Op.Create -> v.create("a new file with a long name.txt")?
+        Op.Append | Op.AppendFat32 ->
+            var f = v.open("growing file.bin")?
+            f.seek(3000)
+            v.write(&f, data(8000, 1).view()[3000..<8000])?
+        Op.Shorten ->
+            var f = v.open("shrinking file.bin")?
+            v.truncate(&f, 2500)?
+        Op.Empty ->
+            var f = v.open("shrinking file.bin")?
+            v.truncate(&f, 0)?
+        Op.Remove -> v.remove("straddling long name.txt")?
+        Op.MakeDir -> v.make_dir("A New Directory")?
+        Op.RemoveDir -> v.remove_dir("old directory")?
+        Op.Grow -> v.create("full/one more file with a long name")?
+        Op.RenameHere -> v.rename("before name.txt", "after name.txt")?
+        Op.RenameAway -> v.rename("src/moving file.bin", "dst/moved file.bin")?
+        Op.MoveDir -> v.rename("src/moving dir", "dst/moved dir")?
+    v.flush()
+
+private const ABSENT: u8 = 0
+private const DIRECTORY: u8 = 1
+private const FILE: u8 = 2
+private const LISTED: u8 = 3
+
+// What one path holds: nothing, a directory, a file of `size` bytes of `data(size, seed)`, or (LISTED) a
+// directory of `size` entries.
+private struct Want
+    path: string
+    kind: u8
+    size: usize
+    seed: usize
+
+private gone(path: string) -> Want = Want(path, ABSENT, 0, 0)
+private dir(path: string) -> Want = Want(path, DIRECTORY, 0, 0)
+private file(path: string, size: usize, seed: usize) -> Want = Want(path, FILE, size, seed)
+private listed(path: string, count: usize) -> Want = Want(path, LISTED, count, 0)
+
+// The volume before the operation (`after` false) or after it.
+private state(op: Op, after: bool) -> Buf[Want]
+    var w: Buf[Want] = buf()
+    op match
+        Op.Create -> w.push(if after then file("a new file with a long name.txt", 0, 0) else gone("a new file with a long name.txt"))
+        Op.Append | Op.AppendFat32 -> w.push(file("growing file.bin", if after then 8000 else 3000, 1))
+        Op.Shorten -> w.push(file("shrinking file.bin", if after then 2500 else 9000, 2))
+        Op.Empty -> w.push(file("shrinking file.bin", if after then 0 else 9000, 2))
+        Op.Remove ->
+            w.push(if after then gone("straddling long name.txt") else file("straddling long name.txt", 5000, 3))
+            w.push(file("f13", 0, 0))
+            w.push(listed("/", if after then 14 else 15))
+        Op.MakeDir -> w.push(if after then dir("A New Directory") else gone("A New Directory"))
+        Op.RemoveDir -> w.push(if after then gone("old directory") else dir("old directory"))
+        Op.Grow ->
+            w.push(if after then file("full/one more file with a long name", 0, 0) else gone("full/one more file with a long name"))
+            w.push(file("full/e29", 0, 0))
+            w.push(listed("full", if after then 33 else 32))
+        Op.RenameHere ->
+            w.push(if after then gone("before name.txt") else file("before name.txt", 4000, 5))
+            w.push(if after then file("after name.txt", 4000, 5) else gone("after name.txt"))
+        Op.RenameAway ->
+            w.push(if after then gone("src/moving file.bin") else file("src/moving file.bin", 4000, 6))
+            w.push(if after then file("dst/moved file.bin", 4000, 6) else gone("dst/moved file.bin"))
+        Op.MoveDir ->
+            w.push(if after then gone("src/moving dir") else file("src/moving dir/inside.bin", 3000, 7))
+            w.push(if after then file("dst/moved dir/inside.bin", 3000, 7) else gone("dst/moved dir"))
+    w
+
+// Whether a name is one `fsck.fat -a` gives a chain of lost clusters it salvages: `FSCK0000.REC` on.
+// Those clusters are what a cut leaves at worst, and their file is fsck's, not either volume's.
+private salvaged(name: string) -> bool = name.len == 12 && name[0..<4] == "FSCK" && name[8..<12] == ".REC"
+
+// How many entries the directory at `path` lists, fsck's salvaged files aside.
+// What a rename between two directories may be repaired to when it is cut between writing the new entry
+// and freeing the old: both names, on one chain, which fsck.fat gives to the name it reaches first,
+// emptying the other. No order of writes avoids it, since the two entries are in different sectors.
+private both_names(op: Op) -> Buf[Buf[Want]]
+    var out: Buf[Buf[Want]] = buf()
+    val names: (string, string, usize, usize) = op match
+        Op.RenameAway -> ("src/moving file.bin", "dst/moved file.bin", 4000, 6)
+        _ -> return out
+    for keeps_old in [true, false]
+        var w: Buf[Want] = buf()
+        w.push(file(names.0, if keeps_old then names.2 else 0, if keeps_old then names.3 else 0))
+        w.push(file(names.1, if keeps_old then 0 else names.2, if keeps_old then 0 else names.3))
+        out.push(w)
+    out
+
+private count_in(v:*Volume[ImageDevice], path: string) -> Option[usize]
+    var d = v.open_dir(path) match
+        Ok(d) -> d
+        Err(_) -> return None
+    var e = empty_entry()
+    var n = 0usize
+    loop
+        v.read_dir(&d, &e) match
+            Ok(true) -> if !salvaged(e.name()) then n += 1
+            Ok(false) -> return Some(n)
+            Err(_) -> return None
+
+// The first of `wants` the volume does not hold, as its path; empty when it holds them all.
+private holds(v: *Volume[ImageDevice], wants: []const Want) -> string
+    for w in wants
+        if w.kind == LISTED
+            if count_in(v, w.path) != Some(w.size) then return f"${w.path} lists ${count_in(v, w.path)}"
+            continue
+        var e = empty_entry()
+        val found = v.find(w.path, &e).is_ok()
+        if w.kind == ABSENT
+            if found then return w.path
+            continue
+        if !found then return w.path
+        if w.kind == DIRECTORY
+            if !e.is_dir() then return w.path
+            continue
+        if e.is_dir() || e.size != u32(w.size) then return w.path
+        var f = v.open(w.path) match
+            Ok(f) -> f
+            Err(_) -> return w.path
+        val got: Buf[u8] = buf_filled(w.size, 0)
+        v.read(&f, got.view()) match
+            Ok(n) -> if n != w.size then return w.path
+            Err(_) -> return w.path
+        if !same_data(got.view(), data(w.size, w.seed).view()) then return w.path
+    ""
+
+private tool(name: string, args: []const string) -> (bool, string)
+    val r = capture(name, args, stderr = true).unwrap()
+    (r.status.ok(), r.text + r.err.unwrap_or(""))
+
+// Both checkers find `image` clean, or the test fails saying `what` was not.
+private require_clean(image: string, what: string)
+    val (linux_ok, linux) = tool(FSCK_FAT, ["-n", "-v", image])
+    if !linux_ok || linux.contains("differ") || linux.contains("wrong") then panic(f"$what is not clean to fsck.fat:\n$linux")
+    val (bsd_ok, bsd) = tool(FSCK_MSDOS, ["-n", image])
+    if !bsd_ok then panic(f"$what is not clean to fsck_msdos:\n$bsd")
+
+// Run `op` on a copy of `base` over a device cut after `left` writes (never, without `left`), and answer
+// how many sectors it wrote.
+private cut_run(op: Op, base: string, image: string, left: Option[u32]) -> u32
+    copy_file(base, image).unwrap()
+    var dev = CutImage(open_image(image).unwrap(), 0, left.unwrap_or(0), left.is_some())
+    val scratch: Buf[u8] = buf_filled(512, 0)
+    var v = mount(&dev, scratch.view()).unwrap()
+    val done = act(op, &v)
+    if left.is_none() then done.unwrap()
+    dev.image.close()
+    dev.writes
+
+private check_op(dir: string, op: Op)
+    val base = f"$dir/$op-base.img"
+    val image = f"$dir/$op.img"
+    val fat32 = op == Op.AppendFat32
+    var dev = create_image(base, if fat32 then 70000 else 8500).unwrap()
+    format(&dev, Some(if fat32 then FatType.Fat32 else FatType.Fat16)).unwrap()
+    dev.close()
+    var setup = CutImage(open_image(base).unwrap(), 0, 0, false)
+    val scratch: Buf[u8] = buf_filled(512, 0)
+    var v = mount(&setup, scratch.view()).unwrap()
+    set_up(op, &v)
+    v.flush().unwrap()
+    setup.image.close()
+    require_clean(base, f"$op: the volume before it")
+
+    val total = cut_run(op, base, image, None)
+    require_clean(image, f"$op: the volume after it")
+    if total == 0 then panic(f"$op wrote nothing")
+    val before = state(op, false)
+    val after = state(op, true)
+    for n in 0..<total + 1
+        cut_run(op, base, image, Some(n))
+        var repair = tool(FSCK_FAT, ["-a", "-v", image]).1
+        // A directory moved between directories and cut while both names hold it takes fsck.fat three
+        // passes: the first empties it under the second name, the second deletes that short entry, the
+        // third its orphaned long name.
+        if op == Op.MoveDir
+            for _ in 0..<3
+                repair = repair + tool(FSCK_FAT, ["-a", "-v", image]).1
+        require_clean(image, f"$op cut after $n of $total writes, once repaired:\n$repair\n")
+        var img = open_image(image).unwrap()
+        val sector: Buf[u8] = buf_filled(512, 0)
+        var back = mount(&img, sector.view()).unwrap()
+        val old_miss = holds(&back, before.view())
+        val new_miss = holds(&back, after.view())
+        val old = old_miss == ""
+        val new = new_miss == ""
+        var both = false
+        for alternative in both_names(op).view()
+            if holds(&back, alternative.view()) == "" then both = true
+        img.close()
+        if !old && !new && !both then panic(f"$op cut after $n of $total writes: repaired to neither the volume before ($old_miss) nor the one after ($new_miss):\n$repair")
+        if n == 0 && !old then panic(f"$op: cut before any write, the volume changed")
+        if n == total && !new then panic(f"$op: not cut at all, the operation did not happen")
+
+@test("every operation cut at every write is repaired by fsck.fat to the volume before it or the one after")
+cut_at_every_write()
+    need_tools()
+    val dir = make_temp_dir("fat-crash-").unwrap()
+    for op in [Op.Create, Op.Append, Op.Shorten, Op.Empty, Op.Remove, Op.MakeDir, Op.RemoveDir, Op.Grow, Op.RenameHere,
+               Op.RenameAway, Op.MoveDir, Op.AppendFat32]
+        check_op(dir, op)
+    remove_dir_all(dir).unwrap()

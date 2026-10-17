@@ -2,13 +2,29 @@ module sh.sysl.fat
 
 import sysl.slices.{copy, fill}
 
-// Writing a mounted volume: allocating and freeing clusters, creating, writing, truncating and
-// removing files, and making and removing directories, with long names and the unique 8.3 names that
-// go with them.
+// Writing a mounted volume: allocating and freeing clusters, creating, writing, truncating, renaming
+// and removing files, and making and removing directories, with long names and the unique 8.3 names
+// that go with them.
 //
 // Writes go through the volume's one sector of storage, as reads do, and a sector of it is written to
 // the device when another is wanted. **Nothing is durable until `flush`**, which also writes FAT32's
-// FSInfo. File data that fills a whole sector goes straight to the device.
+// FSInfo. File data that fills a whole sector goes straight to the device, after the sector in storage.
+//
+// **The device sees the writes in the order they were made**, and each operation makes them in an order
+// that a cut anywhere leaves a volume `fsck.fat` puts back to the state before the operation or the
+// state after it, never to a third. Two rules cover every operation:
+//
+// - A cluster is made ready before anything points at it: it is the end of a chain before a chain is
+//   linked to it, a directory's cluster is zeroed before it is linked, and a file's entry is written
+//   last, so a cut before that leaves clusters nothing names, which fsck frees.
+// - Things are taken away from the top down: an entry's size before its clusters, a short entry before
+//   the long-name entries in front of it, an entry before its clusters. A cut part way leaves clusters
+//   nothing names, a chain longer than its file, or long-name entries with no short entry after them,
+//   and fsck drops each.
+//
+// Rename is the exception: the new entry is written before the old one goes, so a cut between the two
+// writes leaves both names on one chain rather than neither. Where both are in one sector — a rename
+// within a directory that has room in that sector — the one write that carries them makes it whole.
 
 // The end-of-chain marker a writer puts in the FAT.
 private const END16: u32 = 0xFFFF
@@ -134,6 +150,18 @@ private short_form(name: string) -> ShortForm
 private basis_char(c: char) -> u8
     val u = u32(c)
     if u < 0x80 && short_char(u8(u)) then upper(u8(u)) else u8('_')
+
+// Whether a path's last name is `.` or `..`, which name a directory by where it is rather than an entry
+// that can be removed or renamed.
+private ends_in_dot(path: string) -> bool
+    var end = path.len
+    while end > 0 && path[end - 1] == u8('/')
+        end -= 1
+    var start = end
+    while start > 0 && path[start - 1] != u8('/')
+        start -= 1
+    val last = path[start..<end]
+    last == "." || last == ".."
 
 impl[D: BlockDevice] Volume[D]
     // Stamp entries with the time `clock` gives from now on.
@@ -289,11 +317,15 @@ impl[D: BlockDevice] Volume[D]
                     p.index += 1
                 None ->
                     if first == 0 then return Err(FsError.RootFull)
-                    val c = self.allocate(p.cluster)?
+                    // Zeroed before it is linked: a cut between leaves a lost cluster, never a
+                    // directory reaching into a removed file's data.
+                    val c = self.allocate(0)?
                     self.zero_cluster(c)?
+                    self.set_entry(p.cluster, c)?
 
-    // Whether a short entry in the directory at `first` has the 8.3 name `name`.
-    private short_taken(*self, first: u32, name: [11]u8) -> Result[bool, FsError]
+    // Whether a short entry in the directory at `first` other than the one at `skip` has the 8.3 name
+    // `name`.
+    private short_taken(*self, first: u32, name: [11]u8, skip: (u64, usize)) -> Result[bool, FsError]
         var p = Place(first, 0, 0)
         loop
             val pos = self.locate(&p)? match
@@ -303,12 +335,13 @@ impl[D: BlockDevice] Volume[D]
             val raw: *DirEntry = at(self.sector, pos.1)
             val lead = raw.name[0]
             if lead == ENTRY_END then return Ok(false)
-            if lead != ENTRY_FREE && raw.attributes & 0x3F != ATTR_LONG_NAME && raw.name == name then return Ok(true)
+            val other = pos.0 != skip.0 || pos.1 != skip.1
+            if other && lead != ENTRY_FREE && raw.attributes & 0x3F != ATTR_LONG_NAME && raw.name == name then return Ok(true)
             p.index += 1
 
     // `basis` with the first numeric tail, `~1` on, that no short entry in the directory at `first`
-    // has: the base is cut short to make room for the tail.
-    private numbered(*self, first: u32, basis: [11]u8) -> Result[[11]u8, FsError]
+    // has, the one at `skip` aside: the base is cut short to make room for the tail.
+    private numbered(*self, first: u32, basis: [11]u8, skip: (u64, usize)) -> Result[[11]u8, FsError]
         var base = 8usize
         while base > 0 && basis[base - 1] == u8(' ')
             base -= 1
@@ -328,7 +361,7 @@ impl[D: BlockDevice] Volume[D]
             name[keep] = u8('~')
             for k in 0..<count
                 name[keep + 1 + k] = digits[count - 1 - k]
-            if !self.short_taken(first, name)? then return Ok(name)
+            if !self.short_taken(first, name, skip)? then return Ok(name)
             n += 1
         Err(FsError.Exists)
 
@@ -345,8 +378,9 @@ impl[D: BlockDevice] Volume[D]
         Ok((parent, path[start..<end]))
 
     // Add an entry named `name` to `parent`: a run of long-name entries where the name needs one, then
-    // the short entry, every time stamp now. Answers where the short entry is.
-    private add_entry(*self, parent: Dir, name: string, attributes: u8, cluster: u32) -> Result[(u64, usize), FsError]
+    // the short entry, every time stamp now. Answers where the short entry is. The entry whose short
+    // entry is at `skip` is passed over, as a rename passes over the entry it is renaming.
+    private add_entry(*self, parent: Dir, name: string, attributes: u8, cluster: u32, skip: (u64, usize) = (0, 0)) -> Result[(u64, usize), FsError]
         var units: [MAX_NAME_UNITS]u16 = [0; MAX_NAME_UNITS]
         val count = name_units(name, units[..]) match
             Some(n) -> n
@@ -355,12 +389,13 @@ impl[D: BlockDevice] Volume[D]
         var e = empty_entry()
         var short: [48]u8 = [0; 48]
         while self.read_dir(&d, &e)?
+            if e.sector_at == skip.0 && e.offset_at == skip.1 then continue
             val n = short_display(e.short_name, 0, short[..])
             if same_name(e.name_bytes[0..<e.name_len], name) || same_name(short[0..<n], name) then return Err(FsError.Exists)
 
         var form = short_form(name)
-        if form.lossy || self.short_taken(parent.cluster, form.name)?
-            form.name = self.numbered(parent.cluster, form.name)?
+        if form.lossy || self.short_taken(parent.cluster, form.name, skip)?
+            form.name = self.numbered(parent.cluster, form.name, skip)?
         val pieces = if form.needs_long then (count + 12) / 13 else 0
         var p = self.find_room(parent.cluster, u32(pieces) + 1)?
         val sum = short_name_checksum(form.name)
@@ -449,6 +484,7 @@ impl[D: BlockDevice] Volume[D]
             if u64(n) > u64(data.len - done) then n = u32(data.len - done)
             val from = data[done..<done + usize(n)]
             if n == bps
+                self.write_back()?
                 self.dev.write(sector, from)?
                 if self.loaded == sector
                     self.loaded = NO_SECTOR
@@ -479,40 +515,57 @@ impl[D: BlockDevice] Volume[D]
         Ok(())
 
     // Cut `f` to `size` bytes, freeing the clusters it no longer needs; a size at or past its end
-    // changes nothing. A position past the new end moves back to it.
+    // changes nothing. A position past the new end moves back to it. The entry's new size is written
+    // before the chain is cut, so a cut between leaves a chain longer than its file, which fsck cuts.
     truncate(*self, f: *File, size: u32) -> Result[unit, FsError]
         if size >= f.size then return Ok(())
         val first = f.first_cluster
-        if size == 0
-            f.first_cluster = 0
-        else
-            var c = first
+        // The last cluster the file keeps; 0 where it keeps none.
+        var keep = 0u32
+        if size != 0
+            keep = first
             for _ in 0..<(size - 1) / self.geometry.cluster_bytes()
-                c = self.next_cluster(c)? match
+                keep = self.next_cluster(keep)? match
                     Some(n) -> n
                     None -> return Err(FsError.ChainTooShort)
-            self.next_cluster(c)? match
-                Some(n) ->
-                    self.set_entry(c, self.end_marker())?
-                    self.free_chain(n)?
-                None -> ()
+        if size == 0 then f.first_cluster = 0
         f.size = size
         if f.at > size then f.at = size
         f.cluster = 0
         f.cluster_index = 0
         self.update_entry(f)?
-        if size == 0 && first != 0 then self.free_chain(first)?
+        if keep == 0
+            if first != 0 then self.free_chain(first)?
+        else
+            self.next_cluster(keep)? match
+                Some(n) ->
+                    self.set_entry(keep, self.end_marker())?
+                    self.free_chain(n)?
+                None -> ()
         Ok(())
 
-    // Mark every slot of `e`'s run free, then free its clusters.
-    private drop_entry(*self, e: *Entry) -> Result[unit, FsError]
+    // Mark every slot of `e`'s run free, from the short entry back: a cut part way leaves long-name
+    // entries with no short entry after them, which every reader drops, rather than a short entry that
+    // has lost its long name.
+    private free_slots(*self, e: *Entry) -> Result[unit, FsError]
+        // A long name has at most twenty pieces, so a run is at most twenty-one slots.
+        var spots: [21](u64, usize) = [(0, 0); 21]
+        if e.run_len > 21 then return Err(FsError.BadPath)
         var p = Place(e.run_cluster, e.run_index, 0)
-        for _ in 0..<e.run_len
-            val pos = self.slot(&p)?
-            self.load(pos.0)?
-            self.sector[pos.1] = ENTRY_FREE
-            self.dirty = true
+        for k in 0..<e.run_len
+            spots[k] = self.slot(&p)?
             p.index += 1
+        var k = e.run_len
+        while k > 0
+            k -= 1
+            self.load(spots[k].0)?
+            self.sector[spots[k].1] = ENTRY_FREE
+            self.dirty = true
+        Ok(())
+
+    // Free `e`'s slots, then its clusters.
+    private drop_entry(*self, e: *Entry) -> Result[unit, FsError]
+        self.free_slots(e)?
         if e.first_cluster != 0 then self.free_chain(e.first_cluster)?
         Ok(())
 
@@ -529,12 +582,60 @@ impl[D: BlockDevice] Volume[D]
         var e = empty_entry()
         self.find(path, &e)?
         if !e.is_dir() then return Err(FsError.NotADirectory)
-        if e.short_name[0] == u8('.') then return Err(FsError.BadPath)
+        if e.short_name[0] == u8('.') || ends_in_dot(path) then return Err(FsError.BadPath)
         var d = self.open_dir_entry(&e)?
         var inside = empty_entry()
         while self.read_dir(&d, &inside)?
             if inside.short_name[0] != u8('.') then return Err(FsError.NotEmpty)
         self.drop_entry(&e)
+
+    // Give the file or directory `from` names the name and directory `to` names, keeping its clusters,
+    // size, attributes and times. `to` must not name an entry already, other than `from` itself, so a
+    // name's case can change; a directory cannot go inside itself, and its `..` follows it. The new
+    // entry is written before the old one is freed (see the top of this file).
+    rename(*self, from: string, to: string) -> Result[unit, FsError]
+        var e = empty_entry()
+        self.find(from, &e)?
+        if e.short_name[0] == u8('.') || ends_in_dot(from) then return Err(FsError.BadPath)
+        val (parent, name) = self.split(to)?
+        val g = self.geometry
+        // `..` names the root as cluster 0, FAT32's root included.
+        val up = if parent.cluster == g.root_cluster then 0 else parent.cluster
+        var moved = false
+        if e.is_dir()
+            var c = parent.cluster
+            loop
+                if c == e.first_cluster then return Err(FsError.BadPath)
+                if c == 0 || c == g.root_cluster then break
+                c = self.dot_dot(c)?
+            moved = self.dot_dot(e.first_cluster)? != up
+        self.load(e.sector_at)?
+        val was: *DirEntry = at(self.sector, e.offset_at)
+        val old = *was
+        val pos = self.add_entry(parent, name, old.attributes, e.first_cluster, (e.sector_at, e.offset_at))?
+        self.load(pos.0)?
+        val raw: *DirEntry = at(self.sector, pos.1)
+        val short = raw.name
+        val case_bits = raw.nt_reserved
+        *raw = old
+        raw.name = short
+        raw.nt_reserved = case_bits
+        self.dirty = true
+        // Only a directory that changes parent writes its `..`, so a rename within one directory stays
+        // the one write where its two entries share a sector.
+        if moved
+            self.load(u64(g.cluster_start(e.first_cluster)))?
+            val dots: *DirEntry = at(self.sector, 32)
+            dots.first_cluster_high = u16(up >> 16)
+            dots.first_cluster_low = u16(up & 0xFFFF)
+            self.dirty = true
+        self.free_slots(&e)
+
+    // The cluster the `..` entry of the directory at cluster `c` names: 0 for the root.
+    private dot_dot(*self, c: u32) -> Result[u32, FsError]
+        self.load(u64(self.geometry.cluster_start(c)))?
+        val up: *DirEntry = at(self.sector, 32)
+        Ok((u32(up.first_cluster_high) << 16) | u32(up.first_cluster_low))
 end Volume[D]
 
 // Piece `order` of the long name `units` into `l`: thirteen units, the name's NUL after its last and
