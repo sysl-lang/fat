@@ -1,5 +1,6 @@
 module sh.sysl.fat
 
+import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
 
 // The on-disk structures of the spec's sections 3 and 5, each a `@packed`, little-endian struct whose
