@@ -102,3 +102,9 @@ operation, cut by a device that stops writing after each of its writes in turn, 
 built for five freestanding targets, writing included, and the tool.
 
 ISC licence.
+
+`BlockDevice.read_many` and `write_many` accept complete sector spans and default
+to individual sector operations. Devices can override them for native multiblock
+I/O. Aligned file transfers coalesce sectors within each cluster while preserving
+dirty-cache ordering; partial sectors retain the sector-cache path. This API is
+currently available on the `sdmmc-bulk-io` branch.
