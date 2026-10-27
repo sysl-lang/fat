@@ -1,0 +1,60 @@
+module sh.sysl.fat
+@tests
+
+private struct BulkDevice
+    inner: RamDevice
+    reads: u32
+    writes: u32
+    largest: usize
+impl BlockDevice for BulkDevice
+    sector_size(self) -> usize = self.inner.sector_size()
+    sectors(self) -> u64 = self.inner.sectors()
+    read(*self, sector: u64, out: []u8) -> Result[unit,DeviceError] = self.inner.read(sector,out)
+    write(*self, sector: u64, bytes: []const u8) -> Result[unit,DeviceError] = self.inner.write(sector,bytes)
+    flush(*self) -> Result[unit,DeviceError] = self.inner.flush()
+    override read_many(*self, sector: u64, out: []u8) -> Result[unit,DeviceError]
+        self.reads += 1
+        if out.len > self.largest then self.largest = out.len
+        self.inner.read_many(sector,out)
+    override write_many(*self, sector: u64, bytes: []const u8) -> Result[unit,DeviceError]
+        self.writes += 1
+        if bytes.len > self.largest then self.largest = bytes.len
+        self.inner.write_many(sector,bytes)
+
+@test("bulk block I/O: default methods validate the entire span, preserve data and accept empty requests at EOF")
+default_bulk()
+    var dev = ram_device(8)
+    var bytes: [1024]u8 = [0;1024]
+    for i in 0..<1024 do bytes[i] = u8(i * 7)
+    dev.write_many(6,bytes[..]).unwrap()
+    var out: [1024]u8
+    dev.read_many(6,out[..]).unwrap()
+    for i in 0..<1024 do assert(out[i] == bytes[i])
+    assert(dev.read_many(7,out[..]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.write_many(0,bytes[..<513]).err() == Some(DeviceError.BadLength))
+    assert(dev.read_many(8,[]).is_ok() && dev.write_many(8,[]).is_ok())
+    assert(dev.write_many(9,[]).err() == Some(DeviceError.OutOfRange))
+
+@test("FAT bulk I/O: aligned runs use bulk hooks within clusters and preserve partial/dirty cached sectors")
+volume_bulk()
+    var dev = BulkDevice(ram_device(32768),0,0,0)
+    format(&dev,Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0;512]
+    var volume = mount(&dev,cache[..]).unwrap()
+    var file = volume.create("BULK.BIN").unwrap()
+    var input: [8192]u8 = [0;8192]
+    for i in 0..<8192 do input[i] = u8(i * 13)
+    assert(volume.write(&file,input[..]).unwrap() == input.len)
+    assert(dev.writes > 0 && dev.largest > 512)
+    file.seek(0)
+    var out: [8192]u8 = [0;8192]
+    assert(volume.read(&file,out[..]).unwrap() == out.len)
+    for i in 0..<8192 do assert(out[i] == input[i])
+    assert(dev.reads > 0)
+    file.seek(17)
+    val patch: [3]u8 = [71,72,73]
+    volume.write(&file,patch[..]).unwrap()
+    file.seek(0)
+    volume.read(&file,out[..]).unwrap()
+    for i in 0..<8192 do assert(out[i] == (if i >= 17 && i < 20 then patch[i - 17] else input[i]))
+    volume.flush().unwrap()

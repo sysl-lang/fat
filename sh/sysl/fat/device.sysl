@@ -29,6 +29,24 @@ trait BlockDevice
     // Write sector `s` from `data`, which is exactly one sector.
     write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
 
+    // Contiguous whole-sector I/O. Existing devices inherit the single-sector
+    // loop; controllers with native bulk commands override it. Validate the
+    // complete span before the first transfer, including zero-length requests.
+    read_many(*self, sector: u64, out: []u8) -> Result[unit, DeviceError]
+        val size = self.sector_size()
+        if size == 0 || out.len % size != 0 then return Err(DeviceError.BadLength)
+        val count = u64(out.len / size)
+        if sector > self.sectors() || count > self.sectors() - sector then return Err(DeviceError.OutOfRange)
+        for i in 0..<(out.len / size) do self.read(sector + u64(i),out[i * size..<(i + 1) * size])?
+        Ok(())
+    write_many(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError]
+        val size = self.sector_size()
+        if size == 0 || bytes.len % size != 0 then return Err(DeviceError.BadLength)
+        val count = u64(bytes.len / size)
+        if sector > self.sectors() || count > self.sectors() - sector then return Err(DeviceError.OutOfRange)
+        for i in 0..<(bytes.len / size) do self.write(sector + u64(i),bytes[i * size..<(i + 1) * size])?
+        Ok(())
+
     // Everything written before this is durable once it returns.
     flush(*self) -> Result[unit, DeviceError]
 

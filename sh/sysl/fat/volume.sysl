@@ -348,10 +348,17 @@ struct Volume[D: BlockDevice]
             var n = bps - offset
             if u64(n) > u64(out.len - done) then n = u32(out.len - done)
             if n > f.size - f.at then n = f.size - f.at
+            if offset == 0
+                var span = cluster_bytes - within
+                if u64(span) > u64(out.len - done) then span = u32(out.len - done)
+                if span > f.size - f.at then span = f.size - f.at
+                span = (span / bps) * bps
+                // Never bypass a dirty cached sector inside the proposed run.
+                if span >= bps && !(self.dirty && self.loaded >= sector && self.loaded < sector + u64(span / bps)) then n = span
             val into = out[done..<done + usize(n)]
             // A sector the buffer holds may have a write in it the device has not seen.
-            if n == bps && self.loaded != sector
-                self.dev.read(sector, into)?
+            if n >= bps && (n > bps || self.loaded != sector)
+                self.dev.read_many(sector, into)?
             else
                 self.load(sector)?
                 copy(into, self.sector[usize(offset)..<usize(offset + n)])

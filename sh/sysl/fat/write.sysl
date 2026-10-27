@@ -482,11 +482,16 @@ impl[D: BlockDevice] Volume[D]
             val offset = within % bps
             var n = bps - offset
             if u64(n) > u64(data.len - done) then n = u32(data.len - done)
+            if offset == 0
+                var span = cluster_bytes - within
+                if u64(span) > u64(data.len - done) then span = u32(data.len - done)
+                span = (span / bps) * bps
+                if span >= bps then n = span
             val from = data[done..<done + usize(n)]
-            if n == bps
+            if n >= bps
                 self.write_back()?
-                self.dev.write(sector, from)?
-                if self.loaded == sector
+                self.dev.write_many(sector, from)?
+                if self.loaded >= sector && self.loaded < sector + u64(n / bps)
                     self.loaded = NO_SECTOR
                     self.dirty = false
             else
