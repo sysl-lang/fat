@@ -1,0 +1,39 @@
+module sh.sysl.fat
+
+import sysl.io.{Positioned, ReadAt, WriteAt}
+
+// An open file read and written at offsets: `sysl.io`'s `ReadAt` and `WriteAt` over a file of a volume,
+// so a library written against those traits (a WAV reader, a database page store) takes a FAT file with no
+// adapter. It moves the file's position for each call, so a `File` handed to it belongs to it; the
+// volume is shared, as every file of a volume shares it.
+//
+// A read at or past the end answers empty. A write may begin past the end, as `pwrite` may: the gap is
+// filled with zeros first. A write that would take the file past 4 GiB less one byte is `TooLarge`.
+struct FileAt[D: BlockDevice]
+    volume: *Volume[D]
+    file: File
+
+impl[D: BlockDevice] Positioned for FileAt[D]
+    type Error = FsError
+
+    extent(*self) -> Result[u64, FsError] = Ok(u64(self.file.size))
+
+impl[D: BlockDevice] ReadAt for FileAt[D]
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, FsError]
+        if offset >= u64(self.file.size) then return Ok(into[..<0])
+        self.file.seek(u32(offset))
+        Ok(into[..<self.volume.read(&self.file, into)?])
+
+impl[D: BlockDevice] WriteAt for FileAt[D]
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, FsError]
+        if bytes.len == 0 then return Ok(0)
+        if offset > 0xFFFF_FFFF || u64(bytes.len) > 0xFFFF_FFFF - offset then return Err(FsError.TooLarge)
+        self.file.seek(self.file.size)
+        val zeros: [512]u8 = [0; 512]
+        while u64(self.file.size) < offset
+            val gap = offset - u64(self.file.size)
+            self.volume.write(&self.file, zeros[..<if gap < 512 then usize(gap) else 512])?
+        self.file.seek(u32(offset))
+        self.volume.write(&self.file, bytes)
+
+    override sync(*self) -> Result[unit, FsError] = self.volume.flush()

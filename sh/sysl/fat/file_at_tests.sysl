@@ -1,0 +1,118 @@
+module sh.sysl.fat
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.io.{ReadAt, WriteAt, read_exact_at, write_all_at}
+
+// A RAM device whose reads, writes and flushes fail while `failing` is set.
+private struct Failing
+    inner: RamDevice
+    failing: bool
+
+impl BlockDevice for Failing
+    sector_size(self) -> usize = self.inner.sector_size()
+    sectors(self) -> u64 = self.inner.sectors()
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
+        if self.failing then return Err(DeviceError.Io)
+        self.inner.read(s, out)
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+        if self.failing then return Err(DeviceError.Io)
+        self.inner.write(s, data)
+    flush(*self) -> Result[unit, DeviceError]
+        if self.failing then return Err(DeviceError.Io)
+        self.inner.flush()
+
+private bytes(n: usize, seed: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n do out.push(u8((i * 31 + seed) % 253))
+    out
+
+private zeroed(n: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for _ in 0..<n do out.push(0)
+    out
+
+@test("FileAt: bytes written at offsets read back at offsets, across sectors and clusters, and through a fresh open")
+file_at_round_trip()
+    var dev = ram_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var v = mount(&dev, cache[..]).unwrap()
+    var at = FileAt(&v, v.create("AT.BIN").unwrap())
+    assert(at.extent().unwrap() == 0)
+    val first = bytes(5000, 1)
+    write_all_at(&at, 0, first.view()).unwrap()
+    val patch = bytes(700, 2)
+    assert(at.write_at(1000, patch.view()).unwrap() == patch.len())
+    assert(at.extent().unwrap() == 5000)
+    at.sync().unwrap()
+    var reopened = FileAt(&v, v.open("AT.BIN").unwrap())
+    val out = zeroed(5000)
+    assert(read_exact_at(&reopened, 0, out.view()).unwrap().len == 5000)
+    for i in 0..<5000 do assert(out[i] == (if i >= 1000 && i < 1700 then patch[i - 1000] else first[i]))
+    var few: [10]u8 = [0; 10]
+    val got = reopened.read_at(4995, few[..]).unwrap()
+    assert(got.len == 5)
+    for i in 0..<5 do assert(got[i] == first[4995 + i])
+
+@test("FileAt: a read at or past the end answers empty, and an empty write takes nothing anywhere")
+file_at_ends()
+    var dev = ram_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var v = mount(&dev, cache[..]).unwrap()
+    var at = FileAt(&v, v.create("END.BIN").unwrap())
+    var few: [8]u8 = [0; 8]
+    assert(at.read_at(0, few[..]).unwrap().len == 0)
+    write_all_at(&at, 0, bytes(100, 3).view()).unwrap()
+    assert(at.read_at(100, few[..]).unwrap().len == 0)
+    assert(at.read_at(0xFFFF_FFFF_FFFF, few[..]).unwrap().len == 0)
+    assert(at.read_at(0, few[..<0]).unwrap().len == 0)
+    assert(at.write_at(5000, []).unwrap() == 0)
+    assert(at.write_at(0xFFFF_FFFF_FFFF, []).unwrap() == 0)
+    assert(at.extent().unwrap() == 100)
+
+@test("FileAt: a write past the end fills the gap with zeros first, as pwrite does")
+file_at_gap()
+    var dev = ram_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var v = mount(&dev, cache[..]).unwrap()
+    var at = FileAt(&v, v.create("GAP.BIN").unwrap())
+    write_all_at(&at, 0, bytes(10, 4).view()).unwrap()
+    val tail = bytes(20, 5)
+    assert(at.write_at(3000, tail.view()).unwrap() == 20)
+    assert(at.extent().unwrap() == 3020)
+    val out = zeroed(3020)
+    read_exact_at(&at, 0, out.view()).unwrap()
+    for i in 0..<10 do assert(out[i] == bytes(10, 4)[i])
+    for i in 10..<3000 do assert(out[i] == 0)
+    for i in 0..<20 do assert(out[3000 + i] == tail[i])
+
+@test("FileAt: a write past 4 GiB less one byte is TooLarge, whatever the offset, and changes nothing")
+file_at_too_large()
+    var dev = ram_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var v = mount(&dev, cache[..]).unwrap()
+    var at = FileAt(&v, v.create("BIG.BIN").unwrap())
+    val one: [1]u8 = [1]
+    assert(at.write_at(0x1_0000_0000, one[..]).err() == Some(FsError.TooLarge))
+    assert(at.write_at(0xFFFF_FFFF, one[..]).err() == Some(FsError.TooLarge))
+    assert(at.write_at(0xFFFF_FFFF_FFFF_FFFF, one[..]).err() == Some(FsError.TooLarge))
+    assert(at.extent().unwrap() == 0)
+
+@test("FileAt: a device that fails reaches the caller as FsError.Device from read_at, write_at and sync")
+file_at_device_errors()
+    var dev = Failing(ram_device(32768), false)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var v = mount(&dev, cache[..]).unwrap()
+    var at = FileAt(&v, v.create("ERR.BIN").unwrap())
+    write_all_at(&at, 0, bytes(4096, 6).view()).unwrap()
+    at.sync().unwrap()
+    dev.failing = true
+    val out = zeroed(4096)
+    assert(at.read_at(0, out.view()).err() == Some(FsError.Device(DeviceError.Io)))
+    assert(at.write_at(0, bytes(4096, 7).view()).err() == Some(FsError.Device(DeviceError.Io)))
+    assert(at.sync().err() == Some(FsError.Device(DeviceError.Io)))
