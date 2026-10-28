@@ -40,6 +40,9 @@ enum VolumeError derives Eq, Display
     BadName
     // A write past the largest size a file can have, 4 GiB less one byte.
     TooLarge
+    // An operation on a `Volume` that was never mounted — a module `var`, say, before `mount` has filled
+    // it — or on a `FileAt` that was never given a volume.
+    NotMounted
 
 impl From[DeviceError] for VolumeError
     from(e: DeviceError) -> VolumeError = VolumeError.Device(e)
@@ -221,6 +224,11 @@ struct Volume[D: BlockDevice]
     // writes are placed by it.
     geometry -> Geometry = self.layout
 
+    // Whether the volume has been mounted. A `Volume` that is zero-initialised — a module `var`, which
+    // sits at a fixed address — is not: every operation on it answers `VolumeError.NotMounted`, until
+    // `mount`'s result is assigned over it.
+    is_mounted(self) -> bool = usize(self.dev) != 0
+
     // The root directory, from its first entry.
     root(*self) -> Dir = dir_at(if self.layout.fat_type == FatType.Fat32 then self.layout.root_cluster else 0)
 
@@ -268,6 +276,7 @@ struct Volume[D: BlockDevice]
     // after it only if its run is whole and its checksum is that entry's, and is dropped otherwise, as
     // every reader does. `.` and `..` are entries like any other.
     read_dir(*self, d: *Dir, e: *Entry) -> Result[bool, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         val g = self.geometry
         val per_sector = g.bytes_per_sector / 32
         loop
@@ -333,6 +342,7 @@ struct Volume[D: BlockDevice]
     // The directory an entry names. A `..` entry naming the root has cluster 0, and so does FAT16's
     // root; FAT32's root is a cluster like any other.
     open_dir_entry(*self, e: *Entry) -> Result[Dir, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         if !e.is_dir() then return Err(VolumeError.NotADirectory)
         if e.first_cluster == 0 then return Ok(self.root())
         if !self.holds(e.first_cluster) then return Err(VolumeError.BadCluster)
@@ -340,6 +350,7 @@ struct Volume[D: BlockDevice]
 
     // The file an entry names.
     open_entry(*self, e: *Entry) -> Result[File, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         if e.is_dir() then return Err(VolumeError.IsADirectory)
         if e.size != 0 && !self.holds(e.first_cluster) then return Err(VolumeError.BadCluster)
         Ok(file_of(e))
@@ -348,6 +359,7 @@ struct Volume[D: BlockDevice]
     // against both an entry's long name and its 8.3 one without regard to the case of ASCII letters. `.`
     // is the directory it is in, and `..` its parent (the root's is the root).
     find(*self, path: string, e: *Entry) -> Result[unit, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         var d = self.root()
         var at_root = true
         var found = false
@@ -394,6 +406,7 @@ struct Volume[D: BlockDevice]
     // Read from `f` into `out` from its position on, answering how many bytes were read: as many as
     // `out` holds, or fewer at the file's end, where it answers 0.
     read(*self, f: *File, out: []u8) -> Result[usize, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         val g = self.geometry
         val bps = g.bytes_per_sector
         val cluster_bytes = g.cluster_bytes()

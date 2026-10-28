@@ -8,8 +8,12 @@ import sysl.math.is_power_of_two
 // The three FAT types. The spec decides the type by the count of data clusters and by nothing else
 // (section 3.5): the label in the boot sector is informational. The package reads and writes FAT16 and
 // FAT32; a FAT12 volume is recognised and refused.
+//
+// `Fat12` is the enum's zero value, so a `Geometry` and everything holding one (a `Volume`) has a zero
+// and may be a module `var`. A volume is never mounted as FAT12, so the zero reads as "no volume yet":
+// see `Volume.is_mounted`.
 enum FatType derives Display
-    Fat12
+    Fat12 = 0
     Fat16
     Fat32
 

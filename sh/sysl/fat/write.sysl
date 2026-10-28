@@ -208,6 +208,7 @@ impl[D: BlockDevice] Volume[D]
     // Make every write so far durable: the buffer's, and FAT32's FSInfo with the free count and the
     // place to look for a free cluster as they now stand.
     flush(*self) -> Result[unit, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         if self.info_dirty
             self.load(u64(self.info_sector))?
             val f: *FsInfo = at(self.sector, 0)
@@ -429,6 +430,7 @@ impl[D: BlockDevice] Volume[D]
 
     // Make an empty file at `path`, in a directory that is there, and open it.
     create(*self, path: string) -> Result[File, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         val (parent, name) = self.split(path)?
         val pos = self.add_entry(parent, name, ATTR_ARCHIVE, 0)?
         Ok(new_file(0, 0, pos.0, pos.1))
@@ -436,6 +438,7 @@ impl[D: BlockDevice] Volume[D]
     // Make an empty directory at `path`, in a directory that is there, and answer it. Its cluster and
     // its `.` and `..` entries are written before the entry that names it.
     make_dir(*self, path: string) -> Result[Dir, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         val (parent, name) = self.split(path)?
         val g = self.geometry
         val c = self.allocate(0)?
@@ -460,6 +463,7 @@ impl[D: BlockDevice] Volume[D]
     // count and is told why then. Either way the file's entry is brought up to date — its size, first
     // cluster and time written — for what landed. An empty `data` writes nothing and is `Ok(0)`.
     write(*self, f: *File, data: []const u8) -> Result[usize, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         if data.len == 0 then return Ok(0)
         val room = MAX_FILE_SIZE - u64(f.at)
         if room == 0 then return Err(VolumeError.TooLarge)
@@ -535,6 +539,7 @@ impl[D: BlockDevice] Volume[D]
     // changes nothing. A position past the new end moves back to it. The entry's new size is written
     // before the chain is cut, so a cut between leaves a chain longer than its file, which fsck cuts.
     truncate(*self, f: *File, size: u32) -> Result[unit, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         if size >= f.size then return Ok(())
         val first = f.first_cluster
         // The last cluster the file keeps; 0 where it keeps none.
@@ -588,6 +593,7 @@ impl[D: BlockDevice] Volume[D]
 
     // Remove the file `path` names, and free its clusters.
     remove(*self, path: string) -> Result[unit, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         var e = empty_entry()
         self.find(path, &e)?
         if e.is_dir() then return Err(VolumeError.IsADirectory)
@@ -596,6 +602,7 @@ impl[D: BlockDevice] Volume[D]
     // Remove the empty directory `path` names. The root, and a path that ends in `.` or `..`, name no
     // entry that can go.
     remove_dir(*self, path: string) -> Result[unit, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         var e = empty_entry()
         self.find(path, &e)?
         if !e.is_dir() then return Err(VolumeError.NotADirectory)
@@ -611,6 +618,7 @@ impl[D: BlockDevice] Volume[D]
     // name's case can change; a directory cannot go inside itself, and its `..` follows it. The new
     // entry is written before the old one is freed (see the top of this file).
     rename(*self, from: string, to: string) -> Result[unit, VolumeError]
+        if !self.is_mounted() then return Err(VolumeError.NotMounted)
         var e = empty_entry()
         self.find(from, &e)?
         if e.short_name[0] == u8('.') || ends_in_dot(from) then return Err(VolumeError.BadPath)

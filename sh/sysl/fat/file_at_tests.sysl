@@ -129,3 +129,100 @@ mount_device_error()
     val blank: [512]u8 = [0; 512]
     dev.write(0, blank[..]).unwrap()
     assert(mount(&dev, cache[..]).err() == Some(VolumeError.Boot(BootError.NoSignature)))
+
+// Storage that lasts as long as the program, as a board's has: the volume and file handle that use it
+// are module vars too, since a value in a module var may not point into a function's locals.
+const PARK_SECTORS: u64 = 8500
+var park_disk_a: [4352000]u8
+var park_cache_a: [512]u8
+var park_dev_a: RamDevice
+var parked_volume: Volume[RamDevice]
+
+var park_disk_b: [4352000]u8
+var park_cache_b: [512]u8
+var park_dev_b: RamDevice
+var park_volume_b: Volume[RamDevice]
+var parked_file: FileAt[RamDevice]
+
+var park_disk_c: [4352000]u8
+var park_cache_c: [512]u8
+var park_dev_c: RamDevice
+var park_volume_c: Volume[RamDevice]
+var park_file_c: FileAt[RamDevice]
+
+private unmounted_everything(v: *Volume[RamDevice])
+    var e = empty_entry()
+    var f = new_file(0, 0, 0, 0)
+    var d = v.root()
+    var out: [8]u8 = [0; 8]
+    assert(!v.is_mounted())
+    assert_eq(v.geometry.fat_type, FatType.Fat12)
+    assert_eq(v.read_dir(&d, &e).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.find("A.TXT", &e).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.open("A.TXT").unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.open_dir("").unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.open_entry(&e).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.open_dir_entry(&e).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.read(&f, out[..]).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.write(&f, out[..]).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.write(&f, out[..<0]).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.truncate(&f, 0).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.create("A.TXT").unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.make_dir("D").unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.remove("A.TXT").unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.remove_dir("D").unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.rename("A", "B").unwrap_err(), VolumeError.NotMounted)
+    assert_eq(v.flush().unwrap_err(), VolumeError.NotMounted)
+
+@test("a Volume that is a module var is unmounted until mount's result is assigned over it, then works")
+volume_module_var()
+    unmounted_everything(&parked_volume)
+    park_dev_a = ram_device(park_disk_a[..])
+    format(&park_dev_a, Some(FatType.Fat16)).unwrap()
+    parked_volume = mount(&park_dev_a, park_cache_a[..]).unwrap()
+    assert(parked_volume.is_mounted())
+    assert_eq(parked_volume.geometry.fat_type, FatType.Fat16)
+    var f = parked_volume.create("HELLO.TXT").unwrap()
+    val data = bytes(8, 1)
+    assert_eq(parked_volume.write(&f, data.view()).unwrap(), 8usize)
+    parked_volume.flush().unwrap()
+    var g = parked_volume.open("HELLO.TXT").unwrap()
+    var out: [8]u8 = [0; 8]
+    assert_eq(parked_volume.read(&g, out[..]).unwrap(), 8usize)
+    assert_eq(out[3], data[3])
+    assert_eq(parked_volume.open("NOPE.TXT").unwrap_err(), VolumeError.NotFound)
+
+@test("a FileAt that is a module var answers NotMounted everywhere until a real one is assigned, then works")
+file_at_module_var()
+    var few: [4]u8 = [0; 4]
+    assert(!parked_file.is_open())
+    assert_eq(parked_file.extent().unwrap_err(), VolumeError.NotMounted)
+    assert_eq(parked_file.read_at(0, few[..]).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(parked_file.write_at(0, few[..]).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(parked_file.write_at(0, few[..<0]).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(parked_file.sync().unwrap_err(), VolumeError.NotMounted)
+    park_dev_b = ram_device(park_disk_b[..])
+    format(&park_dev_b, Some(FatType.Fat16)).unwrap()
+    park_volume_b = mount(&park_dev_b, park_cache_b[..]).unwrap()
+    parked_file = FileAt(&park_volume_b, park_volume_b.create("AT.BIN").unwrap())
+    assert(parked_file.is_open())
+    val data = bytes(4, 2)
+    assert_eq(parked_file.write_at(0, data.view()).unwrap(), 4usize)
+    assert_eq(parked_file.extent().unwrap(), 4u64)
+    assert_eq(parked_file.read_at(0, few[..]).unwrap().len, 4usize)
+    parked_file.sync().unwrap()
+
+@test("a FileAt over a module var Volume that is not yet mounted answers NotMounted, and works once mounted")
+file_at_over_unmounted_volume()
+    park_file_c = FileAt(&park_volume_c, new_file(0, 0, 0, 0))
+    var few: [4]u8 = [0; 4]
+    assert(!park_file_c.is_open())
+    assert_eq(park_file_c.read_at(0, few[..]).unwrap_err(), VolumeError.NotMounted)
+    assert_eq(park_file_c.sync().unwrap_err(), VolumeError.NotMounted)
+    park_dev_c = ram_device(park_disk_c[..])
+    format(&park_dev_c, Some(FatType.Fat16)).unwrap()
+    park_volume_c = mount(&park_dev_c, park_cache_c[..]).unwrap()
+    park_file_c = FileAt(&park_volume_c, park_volume_c.create("B.BIN").unwrap())
+    val data = bytes(4, 3)
+    assert_eq(park_file_c.write_at(0, data.view()).unwrap(), 4usize)
+    assert_eq(park_file_c.extent().unwrap(), 4u64)

@@ -4,11 +4,24 @@
 // operating system underneath.
 
 import device.StaticDevice
-import sh.sysl.fat.{BlockDevice, FatType, FileAt, empty_entry, format, mount, ram_device}
+import sh.sysl.fat.{BlockDevice, FatType, FileAt, RamDevice, Volume, VolumeError, empty_entry, format, mount, ram_device}
 import sysl.io.{ReadAt, WriteAt}
+
+// A volume and a file handle at fixed addresses, as firmware keeps them: zero data until mounted.
+var parked_disk: [20 * 512]u8
+var parked_cache: [512]u8
+var parked_dev: RamDevice
+var parked_volume: Volume[RamDevice]
+var parked_file: FileAt[RamDevice]
+
+private parked() -> i32
+    if parked_volume.flush() != Err(VolumeError.NotMounted) || parked_file.sync() != Err(VolumeError.NotMounted) then return 20
+    parked_dev = ram_device(parked_disk[..])
+    return 0
 
 @export("main")
 probe() -> i32
+    if parked() != 0 then return 20
     var dev = StaticDevice(20000)
     val made = format(&dev, Some(FatType.Fat16), label = "PROBE")
     if made.is_err() then return 1

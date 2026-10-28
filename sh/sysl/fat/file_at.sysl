@@ -9,23 +9,33 @@ import sysl.io.{Positioned, ReadAt, WriteAt}
 //
 // A read at or past the end answers empty. A write may begin past the end, as `pwrite` may: the gap is
 // filled with zeros first. A write that would take the file past 4 GiB less one byte is `TooLarge`.
+//
+// A zero-initialised `FileAt` — a module `var`, which sits at a fixed address — has no volume: every
+// call on it answers `VolumeError.NotMounted` until a real one is assigned over it.
 struct FileAt[D: BlockDevice]
     volume: *Volume[D]
     file: File
 
+    // Whether it was given a volume, and that volume is mounted.
+    is_open(self) -> bool = usize(self.volume) != 0 && self.volume.is_mounted()
+
 impl[D: BlockDevice] Positioned for FileAt[D]
     type Error = VolumeError
 
-    extent(*self) -> Result[u64, VolumeError] = Ok(u64(self.file.size))
+    extent(*self) -> Result[u64, VolumeError]
+        if !self.is_open() then return Err(VolumeError.NotMounted)
+        Ok(u64(self.file.size))
 
 impl[D: BlockDevice] ReadAt for FileAt[D]
     read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, VolumeError]
+        if !self.is_open() then return Err(VolumeError.NotMounted)
         if offset >= u64(self.file.size) then return Ok(into[..<0])
         self.file.seek(u32(offset))
         Ok(into[..<self.volume.read(&self.file, into)?])
 
 impl[D: BlockDevice] WriteAt for FileAt[D]
     write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, VolumeError]
+        if !self.is_open() then return Err(VolumeError.NotMounted)
         if bytes.len == 0 then return Ok(0)
         if offset > MAX_FILE_SIZE || u64(bytes.len) > MAX_FILE_SIZE - offset then return Err(VolumeError.TooLarge)
         self.file.seek(self.file.size)
@@ -36,4 +46,6 @@ impl[D: BlockDevice] WriteAt for FileAt[D]
         self.file.seek(u32(offset))
         self.volume.write(&self.file, bytes)
 
-    override sync(*self) -> Result[unit, VolumeError] = self.volume.flush()
+    override sync(*self) -> Result[unit, VolumeError]
+        if !self.is_open() then return Err(VolumeError.NotMounted)
+        self.volume.flush()
