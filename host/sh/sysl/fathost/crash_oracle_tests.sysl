@@ -37,6 +37,30 @@ impl BlockDevice for CutImage
         self.image.write(s, data)
     flush(*self) -> Result[unit, DeviceError] = self.image.flush()
 
+// The same device with a multi-sector command, as an SD card driver has: it overrides the bulk hooks and
+// writes a span itself, a sector at a time through the cut, so a power cut stops a multiblock write part
+// way. `spans` counts the writes of more than one sector it is handed.
+struct BulkCutImage
+    cut: CutImage
+    spans: u32
+
+impl BlockDevice for BulkCutImage
+    sector_size(self) -> usize = self.cut.sector_size()
+    sectors(self) -> u64 = self.cut.sectors()
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError] = self.cut.read(s, out)
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError] = self.cut.write(s, data)
+    flush(*self) -> Result[unit, DeviceError] = self.cut.flush()
+
+    override read_many(*self, sector: u64, out: []u8) -> Result[unit, DeviceError] = self.cut.image.read_many(sector, out)
+
+    override write_many(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError]
+        val size = self.sector_size()
+        if bytes.len % size != 0 then return Err(DeviceError.BadLength)
+        if bytes.len > size then self.spans += 1
+        for i in 0..<bytes.len / size
+            self.cut.write(sector + u64(i), bytes[i * size..<(i + 1) * size])?
+        Ok(())
+
 private enum Op derives Display
     Create
     Append
@@ -63,7 +87,7 @@ private same_data(a: []const u8, b: []const u8) -> bool
         if a[i] != b[i] then return false
     true
 
-private write_new(v: *Volume[CutImage], path: string, n: usize, seed: usize)
+private write_new[D: BlockDevice](v: *Volume[D], path: string, n: usize, seed: usize)
     var f = v.create(path).unwrap()
     v.write(&f, data(n, seed).view()).unwrap()
 
@@ -99,7 +123,7 @@ private set_up(op: Op, v: *Volume[CutImage])
             write_new(v, "src/moving dir/inside.bin", 3000, 7)
         _ -> ()
 
-private act(op: Op, v: *Volume[CutImage]) -> Result[unit, FsError]
+private act[D: BlockDevice](op: Op, v: *Volume[D]) -> Result[unit, FsError]
     op match
         Op.Create -> v.create("a new file with a long name.txt")?
         Op.Append | Op.AppendFat32 ->
@@ -238,20 +262,27 @@ private require_clean(image: string, what: string)
     if !bsd_ok then panic(f"$what is not clean to fsck_msdos:\n$bsd")
 
 // Run `op` on a copy of `base` over a device cut after `left` writes (never, without `left`), and answer
-// how many sectors it wrote.
-private cut_run(op: Op, base: string, image: string, left: Option[u32]) -> u32
+// how many sectors it wrote. With `bulk` the device has its own multi-sector writes, and an uncut run
+// must hand it at least one.
+private cut_run(op: Op, base: string, image: string, left: Option[u32], bulk: bool) -> u32
     copy_file(base, image).unwrap()
-    var dev = CutImage(open_image(image).unwrap(), 0, left.unwrap_or(0), left.is_some())
+    var dev = BulkCutImage(CutImage(open_image(image).unwrap(), 0, left.unwrap_or(0), left.is_some()), 0)
     val scratch: Buf[u8] = buf_filled(512, 0)
-    var v = mount(&dev, scratch.view()).unwrap()
-    val done = act(op, &v)
-    if left.is_none() then done.unwrap()
-    dev.image.close()
-    dev.writes
+    val done = if bulk
+        var v = mount(&dev, scratch.view()).unwrap()
+        act(op, &v)
+    else
+        var v = mount(&dev.cut, scratch.view()).unwrap()
+        act(op, &v)
+    if left.is_none()
+        done.unwrap()
+        if bulk && dev.spans == 0 then panic(f"$op wrote no run of sectors through the device's own write_many")
+    dev.cut.image.close()
+    dev.cut.writes
 
-private check_op(dir: string, op: Op)
+private check_op(dir: string, op: Op, bulk: bool)
     val base = f"$dir/$op-base.img"
-    val image = f"$dir/$op.img"
+    val image = if bulk then f"$dir/$op-bulk.img" else f"$dir/$op.img"
     val fat32 = op == Op.AppendFat32
     var dev = create_image(base, if fat32 then 70000 else 8500).unwrap()
     format(&dev, Some(if fat32 then FatType.Fat32 else FatType.Fat16)).unwrap()
@@ -264,13 +295,13 @@ private check_op(dir: string, op: Op)
     setup.image.close()
     require_clean(base, f"$op: the volume before it")
 
-    val total = cut_run(op, base, image, None)
+    val total = cut_run(op, base, image, None, bulk)
     require_clean(image, f"$op: the volume after it")
     if total == 0 then panic(f"$op wrote nothing")
     val before = state(op, false)
     val after = state(op, true)
     for n in 0..<total + 1
-        cut_run(op, base, image, Some(n))
+        cut_run(op, base, image, Some(n), bulk)
         var repair = tool(FSCK_FAT, ["-a", "-v", image]).1
         // A directory moved between directories and cut while both names hold it takes fsck.fat three
         // passes: the first empties it under the second name, the second deletes that short entry, the
@@ -300,5 +331,15 @@ cut_at_every_write()
     val dir = make_temp_dir("fat-crash-").unwrap()
     for op in [Op.Create, Op.Append, Op.Shorten, Op.Empty, Op.Remove, Op.MakeDir, Op.RemoveDir, Op.Grow, Op.RenameHere,
                Op.RenameAway, Op.MoveDir, Op.AppendFat32]
-        check_op(dir, op)
+        check_op(dir, op, false)
+    remove_dir_all(dir).unwrap()
+
+// An append writes file data, which goes to the device in runs of sectors within a cluster: over a device
+// with its own multi-sector write, as an SD card driver overrides `write_many`, the order still holds
+// when a run is cut part way. (AppendFat32's small volume has one-sector clusters, so no runs.)
+@test("an append cut at every write, over a device with its own multi-sector writes, is repaired to before or after")
+cut_bulk_at_every_write()
+    need_tools()
+    val dir = make_temp_dir("fat-crash-bulk-").unwrap()
+    check_op(dir, Op.Append, true)
     remove_dir_all(dir).unwrap()

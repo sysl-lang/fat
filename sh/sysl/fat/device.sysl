@@ -29,26 +29,36 @@ trait BlockDevice
     // Write sector `s` from `data`, which is exactly one sector.
     write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
 
-    // Contiguous whole-sector I/O. Existing devices inherit the single-sector
-    // loop; controllers with native bulk commands override it. Validate the
-    // complete span before the first transfer, including zero-length requests.
+    // Copy the sectors from `sector` on into `out`, which is a whole number of them. The whole span is
+    // checked before anything is read, an empty one too, and then each sector is read with `read`, in
+    // order. A device with a multi-sector command overrides it.
     read_many(*self, sector: u64, out: []u8) -> Result[unit, DeviceError]
         val size = self.sector_size()
-        if size == 0 || out.len % size != 0 then return Err(DeviceError.BadLength)
-        val count = u64(out.len / size)
-        if sector > self.sectors() || count > self.sectors() - sector then return Err(DeviceError.OutOfRange)
-        for i in 0..<(out.len / size) do self.read(sector + u64(i),out[i * size..<(i + 1) * size])?
+        for i in 0..<span(size, self.sectors(), sector, out.len)?
+            val at = usize(i) * size
+            self.read(sector + i, out[at..<at + size])?
         Ok(())
+
+    // Write the sectors from `sector` on from `bytes`, which is a whole number of them, checked as
+    // `read_many` checks and then written with `write`, in order. The volume calls it only once its own
+    // buffer is written back, so a device that overrides it still sees writes in program order.
     write_many(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError]
         val size = self.sector_size()
-        if size == 0 || bytes.len % size != 0 then return Err(DeviceError.BadLength)
-        val count = u64(bytes.len / size)
-        if sector > self.sectors() || count > self.sectors() - sector then return Err(DeviceError.OutOfRange)
-        for i in 0..<(bytes.len / size) do self.write(sector + u64(i),bytes[i * size..<(i + 1) * size])?
+        for i in 0..<span(size, self.sectors(), sector, bytes.len)?
+            val at = usize(i) * size
+            self.write(sector + i, bytes[at..<at + size])?
         Ok(())
 
     // Everything written before this is durable once it returns.
     flush(*self) -> Result[unit, DeviceError]
+
+// How many sectors `len` bytes from `sector` are, on a device of `total` sectors of `size` bytes: refused
+// when they are not whole sectors, or run past the device's end.
+private span(size: usize, total: u64, sector: u64, len: usize) -> Result[u64, DeviceError]
+    if size == 0 || len % size != 0 then return Err(DeviceError.BadLength)
+    val count = u64(len / size)
+    if sector > total || count > total - sector then return Err(DeviceError.OutOfRange)
+    Ok(count)
 
 // A device in memory, for tests and RAM disks. Unlike the rest of the package it allocates: its
 // sectors are one `Buf`.

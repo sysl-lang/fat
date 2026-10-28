@@ -1,60 +1,200 @@
 module sh.sysl.fat
 @tests
 
+import sysl.buf.{Buf, buf}
+
+// A device with native multi-sector commands: it overrides both hooks, records every span it is handed,
+// and, while `left` is set, writes only that many more sectors of a span before failing, as a card that
+// loses power part way through a multiblock write would.
 private struct BulkDevice
     inner: RamDevice
     reads: u32
     writes: u32
     largest: usize
+    starts: Buf[u64]
+    lens: Buf[usize]
+    left: Option[u32]
+
+private bulk_device(sectors: u64) -> BulkDevice = BulkDevice(ram_device(sectors), 0, 0, 0, buf(), buf(), None)
+
 impl BlockDevice for BulkDevice
     sector_size(self) -> usize = self.inner.sector_size()
     sectors(self) -> u64 = self.inner.sectors()
-    read(*self, sector: u64, out: []u8) -> Result[unit,DeviceError] = self.inner.read(sector,out)
-    write(*self, sector: u64, bytes: []const u8) -> Result[unit,DeviceError] = self.inner.write(sector,bytes)
-    flush(*self) -> Result[unit,DeviceError] = self.inner.flush()
-    override read_many(*self, sector: u64, out: []u8) -> Result[unit,DeviceError]
+    read(*self, sector: u64, out: []u8) -> Result[unit, DeviceError] = self.inner.read(sector, out)
+    write(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError] = self.inner.write(sector, bytes)
+    flush(*self) -> Result[unit, DeviceError] = self.inner.flush()
+    override read_many(*self, sector: u64, out: []u8) -> Result[unit, DeviceError]
         self.reads += 1
-        if out.len > self.largest then self.largest = out.len
-        self.inner.read_many(sector,out)
-    override write_many(*self, sector: u64, bytes: []const u8) -> Result[unit,DeviceError]
+        self.note(sector, out.len)
+        self.inner.read_many(sector, out)
+    override write_many(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError]
         self.writes += 1
-        if bytes.len > self.largest then self.largest = bytes.len
-        self.inner.write_many(sector,bytes)
+        self.note(sector, bytes.len)
+        val size = self.sector_size()
+        self.left match
+            Some(n) ->
+                val take = if usize(n) * size < bytes.len then usize(n) * size else bytes.len
+                self.inner.write_many(sector, bytes[..<take])?
+                self.left = Some(n - u32(take / size))
+                if take < bytes.len then return Err(DeviceError.Io)
+                Ok(())
+            None -> self.inner.write_many(sector, bytes)
+
+impl BulkDevice
+    note(*self, sector: u64, len: usize)
+        if len > self.largest then self.largest = len
+        self.starts.push(sector)
+        self.lens.push(len)
+
+    // Whether every span recorded lies inside one cluster of `g`.
+    within_clusters(self, g: Geometry) -> bool
+        val first = u64(g.first_data_sector)
+        val per = u64(g.sectors_per_cluster)
+        for i in 0..<self.starts.len()
+            val last = self.starts[i] + u64(self.lens[i] / 512) - 1
+            if (self.starts[i] - first) / per != (last - first) / per then return false
+        true
+
+// A device with no bulk command whose `write` fails once `left` sectors are written: the default
+// `write_many` loop is cut part way.
+private struct CutWrites
+    inner: RamDevice
+    left: u32
+
+impl BlockDevice for CutWrites
+    sector_size(self) -> usize = self.inner.sector_size()
+    sectors(self) -> u64 = self.inner.sectors()
+    read(*self, sector: u64, out: []u8) -> Result[unit, DeviceError] = self.inner.read(sector, out)
+    write(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError]
+        if self.left == 0 then return Err(DeviceError.Io)
+        self.left -= 1
+        self.inner.write(sector, bytes)
+    flush(*self) -> Result[unit, DeviceError] = self.inner.flush()
+
+private pattern(n: usize, seed: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n do out.push(u8((i * 13 + seed * 7) % 251))
+    out
 
 @test("bulk block I/O: default methods validate the entire span, preserve data and accept empty requests at EOF")
 default_bulk()
     var dev = ram_device(8)
-    var bytes: [1024]u8 = [0;1024]
+    var bytes: [1024]u8 = [0; 1024]
     for i in 0..<1024 do bytes[i] = u8(i * 7)
-    dev.write_many(6,bytes[..]).unwrap()
+    dev.write_many(6, bytes[..]).unwrap()
     var out: [1024]u8
-    dev.read_many(6,out[..]).unwrap()
+    dev.read_many(6, out[..]).unwrap()
     for i in 0..<1024 do assert(out[i] == bytes[i])
-    assert(dev.read_many(7,out[..]).err() == Some(DeviceError.OutOfRange))
-    assert(dev.write_many(0,bytes[..<513]).err() == Some(DeviceError.BadLength))
-    assert(dev.read_many(8,[]).is_ok() && dev.write_many(8,[]).is_ok())
-    assert(dev.write_many(9,[]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.read_many(7, out[..]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.write_many(0, bytes[..<513]).err() == Some(DeviceError.BadLength))
+    assert(dev.read_many(8, []).is_ok() && dev.write_many(8, []).is_ok())
+    assert(dev.write_many(9, []).err() == Some(DeviceError.OutOfRange))
+
+@test("bulk block I/O: a refused span moves nothing, and a span reaching the top of u64 does not wrap")
+refused_spans()
+    var dev = ram_device(8)
+    val ones: [1024]u8 = [1; 1024]
+    assert(dev.write_many(7, ones[..]).err() == Some(DeviceError.OutOfRange))
+    var out: [1024]u8 = [9; 1024]
+    dev.read_many(6, out[..]).unwrap()
+    for b in out do assert(b == 0)
+    assert(dev.read_many(0, out[..<100]).err() == Some(DeviceError.BadLength))
+    assert(dev.read_many(0xFFFF_FFFF_FFFF_FFFF, out[..<512]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.write_many(0xFFFF_FFFF_FFFF_FFFF, ones[..<512]).err() == Some(DeviceError.OutOfRange))
+
+@test("bulk block I/O: the default write_many stops at the first failed sector and reports it")
+default_cut()
+    var dev = CutWrites(ram_device(8), 1)
+    val ones: [1536]u8 = [1; 1536]
+    assert(dev.write_many(2, ones[..]).err() == Some(DeviceError.Io))
+    var out: [512]u8
+    dev.read(2, out[..]).unwrap()
+    for b in out do assert(b == 1)
+    dev.read(3, out[..]).unwrap()
+    for b in out do assert(b == 0)
 
 @test("FAT bulk I/O: aligned runs use bulk hooks within clusters and preserve partial/dirty cached sectors")
 volume_bulk()
-    var dev = BulkDevice(ram_device(32768),0,0,0)
-    format(&dev,Some(FatType.Fat16)).unwrap()
-    var cache: [512]u8 = [0;512]
-    var volume = mount(&dev,cache[..]).unwrap()
+    var dev = bulk_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    val cluster = usize(volume.geometry.cluster_bytes())
+    assert(cluster > 512)
     var file = volume.create("BULK.BIN").unwrap()
-    var input: [8192]u8 = [0;8192]
+    var input: [8192]u8 = [0; 8192]
     for i in 0..<8192 do input[i] = u8(i * 13)
-    assert(volume.write(&file,input[..]).unwrap() == input.len)
-    assert(dev.writes > 0 && dev.largest > 512)
+    assert(volume.write(&file, input[..]).unwrap() == input.len)
+    assert(dev.writes > 0 && dev.largest == cluster)
     file.seek(0)
-    var out: [8192]u8 = [0;8192]
-    assert(volume.read(&file,out[..]).unwrap() == out.len)
+    var out: [8192]u8 = [0; 8192]
+    assert(volume.read(&file, out[..]).unwrap() == out.len)
     for i in 0..<8192 do assert(out[i] == input[i])
     assert(dev.reads > 0)
     file.seek(17)
-    val patch: [3]u8 = [71,72,73]
-    volume.write(&file,patch[..]).unwrap()
+    val patch: [3]u8 = [71, 72, 73]
+    volume.write(&file, patch[..]).unwrap()
     file.seek(0)
-    volume.read(&file,out[..]).unwrap()
+    volume.read(&file, out[..]).unwrap()
     for i in 0..<8192 do assert(out[i] == (if i >= 17 && i < 20 then patch[i - 17] else input[i]))
     volume.flush().unwrap()
+    assert(dev.within_clusters(volume.geometry))
+
+@test("FAT bulk I/O: a run starting part way into a cluster stops at the cluster's end, writing and reading")
+volume_bulk_unaligned()
+    var dev = bulk_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    val cluster = volume.geometry.cluster_bytes()
+    var file = volume.create("SKEW.BIN").unwrap()
+    val head = pattern(usize(cluster) + 512, 1)
+    volume.write(&file, head.view()).unwrap()
+    val body = pattern(3 * usize(cluster), 2)
+    file.seek(512)
+    volume.write(&file, body.view()).unwrap()
+    file.seek(512)
+    var out: Buf[u8] = buf()
+    for _ in 0..<body.len() do out.push(0)
+    assert(volume.read(&file, out.view()).unwrap() == body.len())
+    for i in 0..<body.len() do assert(out[i] == body[i])
+    assert(dev.largest == usize(cluster))
+    assert(dev.within_clusters(volume.geometry))
+
+@test("FAT bulk I/O: a bulk write cut part way fails the write, and the file reads as the device holds it after")
+volume_bulk_cut()
+    var dev = bulk_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    var file = volume.create("CUT.BIN").unwrap()
+    val old = pattern(2048, 3)
+    volume.write(&file, old.view()).unwrap()
+    volume.flush().unwrap()
+    // A short read of the first sector leaves it in the volume's buffer, which the cut write makes stale.
+    file.seek(0)
+    var few: [4]u8 = [0; 4]
+    volume.read(&file, few[..]).unwrap()
+    val new = pattern(2048, 4)
+    dev.left = Some(1)
+    file.seek(0)
+    assert(volume.write(&file, new.view()).err() == Some(FsError.Device(DeviceError.Io)))
+    dev.left = None
+    file.seek(0)
+    volume.read(&file, few[..]).unwrap()
+    for i in 0..<4 do assert(few[i] == new[i])
+    var second: [4]u8 = [0; 4]
+    file.seek(512)
+    volume.read(&file, second[..]).unwrap()
+    for i in 0..<4 do assert(second[i] == old[512 + i])
+
+@test("FAT bulk I/O: a write over the default loop cut part way reports the device's error")
+volume_default_cut()
+    var dev = CutWrites(ram_device(32768), 0xFFFF_FFFF)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    var file = volume.create("CUT.BIN").unwrap()
+    volume.flush().unwrap()
+    dev.left = 3
+    assert(volume.write(&file, pattern(8192, 5).view()).err() == Some(FsError.Device(DeviceError.Io)))
