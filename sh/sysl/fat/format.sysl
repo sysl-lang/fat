@@ -1,5 +1,6 @@
 module sh.sysl.fat
 
+import sysl.encoding.put_u32_le
 import sysl.slices.fill
 
 // Formatting a device: choosing the FAT type and cluster size for its size, laying the volume out, and
@@ -122,7 +123,7 @@ plan(device_sectors: u64, sector_size: usize, fat_type: Option[FatType] = None, 
     if wanted & (wanted - 1) != 0 || wanted > 32768 then return Err(FormatError.BadClusterSize)
     // A table cluster smaller than a sector is a cluster of one sector; an asked-for one is refused.
     if wanted < bps && cluster_bytes != 0 then return Err(FormatError.BadClusterSize)
-    val spc = if wanted < bps then 1u32 else wanted / bps
+    val spc = if wanted < bps then 1 else wanted / bps
 
     val fat32 = kind == FatType.Fat32
     val reserved = if fat32 then 32u32 else 1u32
@@ -225,8 +226,7 @@ private put_entry16(out: []u8, i: usize, v: u16)
     out[2 * i + 1] = u8(v >> 8)
 
 private put_entry32(out: []u8, i: usize, v: u32)
-    for k in 0usize..<4
-        out[4 * i + k] = u8((v >> u32(8 * k)) & 0xFF)
+    put_u32_le(out[4 * i..<4 * i + 4], v)
 
 // The largest sector the package handles; `format` keeps one of these on its stack.
 const MAX_SECTOR: usize = 4096

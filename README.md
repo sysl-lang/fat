@@ -10,7 +10,7 @@ authors or trademark holders.*
 
 ```hocon
 dependencies {
-  fat { git = "github.com/sysl-lang/fat", version = "0.2.0" }
+  fat { git = "github.com/sysl-lang/fat", version = "0.2.1" }
 }
 ```
 
@@ -20,7 +20,7 @@ import sh.sysl.fat.format
 val g = format(&card, label = "CAMERA")?      // FAT16 up to 512 MiB, FAT32 above
 ```
 
-Reading allocates nothing: the volume reads through one sector the caller hands it, and a file's data
+Nothing allocates except `RamDevice`, the in-memory test device: the volume reads through one sector the caller hands it, and a file's data
 goes straight into the caller's buffer.
 
 ```sysl

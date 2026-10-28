@@ -1,5 +1,6 @@
 module sh.sysl.fat
 
+import sysl.encoding.put_u32_le
 import sysl.slices.{copy, fill}
 
 // Writing a mounted volume: allocating and freeing clusters, creating, writing, truncating, renaming
@@ -221,8 +222,7 @@ impl[D: BlockDevice] Volume[D]
         val s = self.sector
         if self.geometry.fat_type == FatType.Fat32
             val v = value & 0x0FFF_FFFF | u32(s[at + 3] & 0xF0) << 24
-            for k in 0usize..<4
-                s[at + k] = u8((v >> u32(8 * k)) & 0xFF)
+            put_u32_le(s[at..<at + 4], v)
         else
             s[at] = u8(value & 0xFF)
             s[at + 1] = u8((value >> 8) & 0xFF)
@@ -336,7 +336,7 @@ impl[D: BlockDevice] Volume[D]
             val lead = raw.name[0]
             if lead == ENTRY_END then return Ok(false)
             val other = pos.0 != skip.0 || pos.1 != skip.1
-            if other && lead != ENTRY_FREE && raw.attributes & 0x3F != ATTR_LONG_NAME && raw.name == name then return Ok(true)
+            if other && lead != ENTRY_FREE && raw.attributes & ATTR_LONG_NAME_MASK != ATTR_LONG_NAME && raw.name == name then return Ok(true)
             p.index += 1
 
     // `basis` with the first numeric tail, `~1` on, that no short entry in the directory at `first`
@@ -428,7 +428,7 @@ impl[D: BlockDevice] Volume[D]
     create(*self, path: string) -> Result[File, FsError]
         val (parent, name) = self.split(path)?
         val pos = self.add_entry(parent, name, ATTR_ARCHIVE, 0)?
-        Ok(File(0, 0, 0, 0, 0, pos.0, pos.1))
+        Ok(new_file(0, 0, pos.0, pos.1))
 
     // Make an empty directory at `path`, in a directory that is there, and answer it. Its cluster and
     // its `.` and `..` entries are written before the entry that names it.

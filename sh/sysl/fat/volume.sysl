@@ -80,7 +80,25 @@ struct Entry
 end Entry
 
 // An entry with no name and nothing in it, to be filled by `read_dir`.
-empty_entry() -> Entry = Entry([0; MAX_NAME_BYTES], 0, [0; 11], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+empty_entry() -> Entry
+    Entry(
+        name_bytes = [0; MAX_NAME_BYTES],
+        name_len = 0,
+        short_name = [0; 11],
+        attributes = 0,
+        first_cluster = 0,
+        size = 0,
+        created_date = 0,
+        created_time = 0,
+        written_date = 0,
+        written_time = 0,
+        accessed_date = 0,
+        sector_at = 0,
+        offset_at = 0,
+        run_cluster = 0,
+        run_index = 0,
+        run_len = 0,
+    )
 
 // A place in a directory, and the long name being gathered there. `read_dir` moves it on one entry at a
 // time.
@@ -108,7 +126,19 @@ struct Dir
         self.pieces = 0
 end Dir
 
-private[fat] dir_at(cluster: u32) -> Dir = Dir(cluster, 0, 0, false, [0; MAX_NAME_UNITS], 0, 0, 0, 0, 0)
+private[fat] dir_at(cluster: u32) -> Dir
+    Dir(
+        cluster = cluster,
+        index = 0,
+        steps = 0,
+        finished = false,
+        units = [0; MAX_NAME_UNITS],
+        expect = 0,
+        pieces = 0,
+        checksum = 0,
+        run_cluster = 0,
+        run_index = 0,
+    )
 
 // An open file: where its data is, how long it is, and where the next read begins.
 struct File
@@ -130,7 +160,19 @@ struct File
         self.at = if position < self.size then position else self.size
 end File
 
-private[fat] file_of(e: *Entry) -> File = File(e.first_cluster, e.size, 0, 0, 0, e.sector_at, e.offset_at)
+private[fat] file_of(e: *Entry) -> File = new_file(e.first_cluster, e.size, e.sector_at, e.offset_at)
+
+// A file at its start, with no cluster of its chain visited yet.
+private[fat] new_file(first_cluster: u32, size: u32, entry_sector: u64, entry_offset: usize) -> File
+    File(
+        first_cluster = first_cluster,
+        size = size,
+        at = 0,
+        cluster = 0,
+        cluster_index = 0,
+        entry_sector = entry_sector,
+        entry_offset = entry_offset,
+    )
 
 struct Volume[D: BlockDevice]
     private[fat] dev: *D
@@ -171,7 +213,7 @@ struct Volume[D: BlockDevice]
     next_cluster(*self, c: u32) -> Result[Option[u32], FsError]
         if !self.holds(c) then return Err(FsError.BadCluster)
         val entry = self.fat_entry(c)?
-        val end_of_chain = if self.geometry.fat_type == FatType.Fat32 then 0x0FFF_FFF8u32 else 0xFFF8u32
+        val end_of_chain = if self.geometry.fat_type == FatType.Fat32 then CHAIN_END_MIN32 else CHAIN_END_MIN16
         if entry >= end_of_chain then return Ok(None)
         if !self.holds(entry) then return Err(FsError.BadCluster)
         Ok(Some(entry))
@@ -232,7 +274,7 @@ struct Volume[D: BlockDevice]
             if first == ENTRY_FREE
                 d.drop_long_name()
                 continue
-            if raw.attributes & 0x3F == ATTR_LONG_NAME
+            if raw.attributes & ATTR_LONG_NAME_MASK == ATTR_LONG_NAME
                 gather(d, at(self.sector, offset))
                 continue
             if raw.attributes & ATTR_VOLUME_ID != 0
@@ -371,7 +413,7 @@ end Volume
 // marked last; each entry after it must number one less and carry the same checksum, or what was
 // gathered is dropped. An entry that is not part of a run in progress is passed over.
 private gather(d: *Dir, l: *LongNameEntry)
-    val order = l.order & 0x3F
+    val order = l.order & LONG_ORDER_MASK
     if l.order & LAST_LONG_ENTRY != 0
         if order == 0 || usize(order) * 13 > MAX_NAME_UNITS
             d.drop_long_name()
@@ -400,6 +442,18 @@ mount[D: BlockDevice](dev: *D, sector: []u8) -> Result[Volume[D], FsError]
     // The boot sector is still in the buffer: bit 7 of FAT32's flags turns mirroring off.
     val tail: *Fat32Tail = at(sector, TAIL_OFFSET)
     val mirrored = g.fat_type != FatType.Fat32 || tail.ext_flags & 0x80 == 0
-    var v = Volume(dev, g, sector, NO_SECTOR, false, mirrored, 0, FSINFO_UNKNOWN, 2, false, None)
+    var v = Volume(
+        dev = dev,
+        geometry = g,
+        sector = sector,
+        loaded = NO_SECTOR,
+        dirty = false,
+        mirrored = mirrored,
+        info_sector = 0,
+        free_count = FSINFO_UNKNOWN,
+        next_free = 2,
+        info_dirty = false,
+        clock = None,
+    )
     v.read_fs_info()?
     Ok(v)

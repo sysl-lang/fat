@@ -6,7 +6,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       fat { git = "github.com/sysl-lang/fat", version = "<the first tag>" }
+//       fat { git = "github.com/sysl-lang/fat", version = "0.2.1" }
 //     }
 //
 // The module is `sh.sysl.fat`. The specification followed is Microsoft's "FAT: General Overview of
@@ -14,7 +14,7 @@
 
 package {
   name    = "fat"
-  version = "0.2.0"
+  version = "0.2.1"
   sysl    = "0.7.5"
 }
 

@@ -22,5 +22,5 @@ val EPOCH: Stamp = Stamp(0x0021, 0, 0)
 // The stamp of a time, given as the calendar has it. A year before 1980 is 1980 and one past 2107 is
 // 2107, the years seven bits hold; the other fields are taken as they are.
 fat_stamp(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Stamp
-    val y = if year < 1980 then 0u32 else if year > 2107 then 127u32 else year - 1980
+    val y = if year < 1980 then 0 else if year > 2107 then 127 else year - 1980
     Stamp(u16(y << 9 | month << 5 | day), u16(hour << 11 | minute << 5 | second / 2), u8(second % 2 * 100))

@@ -122,6 +122,13 @@ struct LongNameEntry
 // The attribute byte that marks a long-name entry, and the order bit that marks a run's first entry.
 const ATTR_LONG_NAME: u8 = 0x0F
 const LAST_LONG_ENTRY: u8 = 0x40
+// The attribute bits that identify a long-name entry; the top two are reserved.
+const ATTR_LONG_NAME_MASK: u8 = 0x3F
+// A long-name entry's order number, without `LAST_LONG_ENTRY`.
+const LONG_ORDER_MASK: u8 = 0x3F
+// The first value of a FAT entry that ends a cluster chain.
+const CHAIN_END_MIN16: u32 = 0xFFF8
+const CHAIN_END_MIN32: u32 = 0x0FFF_FFF8
 
 // What the first byte of a short entry's name says when it is not the name's first character: a free
 // entry, the end of the directory, and a name that really begins with 0xE5 (which is kept as 0x05).

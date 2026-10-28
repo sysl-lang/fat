@@ -1,3 +1,4 @@
+@no_alloc
 // Formats a volume over a device in static memory, then mounts it, writes a directory and a file into it,
 // lists its root, reads the file back and at offsets, renames and removes it: the whole package, instantiated with no
 // operating system underneath.

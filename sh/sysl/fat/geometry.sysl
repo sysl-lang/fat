@@ -1,5 +1,7 @@
 module sh.sysl.fat
 
+import sysl.math.is_power_of_two
+
 // What a boot sector says about where everything on the volume is, checked against the spec and against
 // the device it was read from.
 
@@ -88,8 +90,6 @@ struct Geometry derives Eq, Display
     // The highest valid cluster number.
     last_cluster(self) -> u32 = self.clusters + 1
 end Geometry
-
-private is_power_of_two(n: u32) -> bool = n != 0 && n & (n - 1) == 0
 
 // Read the boot sector of `dev` and check it. `scratch` is one sector of the device's size.
 read_geometry[D: BlockDevice](dev: *D, scratch: []u8) -> Result[Geometry, BootError]
