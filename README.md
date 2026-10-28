@@ -10,7 +10,7 @@ authors or trademark holders.*
 
 ```hocon
 dependencies {
-  fat { git = "github.com/sysl-lang/fat", version = "0.1.0" }
+  fat { git = "github.com/sysl-lang/fat", version = "0.2.0" }
 }
 ```
 
@@ -75,7 +75,26 @@ trait BlockDevice
     sectors(self) -> u64
     read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
     write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+    read_many(*self, sector: u64, out: []u8) -> Result[unit, DeviceError]        // default: `read` per sector
+    write_many(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError] // default: `write` per sector
     flush(*self) -> Result[unit, DeviceError]
+```
+
+A file's data goes to and from the device in runs of whole sectors, up to a cluster at a time, through
+`read_many` and `write_many`; a device with a multi-sector command (an SD card's CMD18 and CMD25)
+overrides them, and the volume's buffer is written back before every run, so the device still sees the
+writes in order. A part of a sector goes through the volume's one sector as before.
+
+An open file is also a positioned store — `sysl.io`'s `ReadAt` and `WriteAt` — so a library written
+against those traits takes it with no adapter:
+
+```sysl
+import sh.sysl.fat.FileAt
+
+var at = FileAt(&v, v.open("/audio/take 1.wav")?)
+val header = read_exact_at(&at, 0, buffer)?
+at.write_at(4, size)?                     // past the end, the gap is filled with zeros
+at.sync()?                                // the volume's flush
 ```
 
 ## mkfs.fat
@@ -102,9 +121,3 @@ operation, cut by a device that stops writing after each of its writes in turn, 
 built for five freestanding targets, writing included, and the tool.
 
 ISC licence.
-
-`BlockDevice.read_many` and `write_many` accept complete sector spans and default
-to individual sector operations. Devices can override them for native multiblock
-I/O. Aligned file transfers coalesce sectors within each cluster while preserving
-dirty-cache ordering; partial sectors retain the sector-cache path. This API is
-currently available on the `sdmmc-bulk-io` branch.
