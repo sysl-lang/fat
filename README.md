@@ -10,7 +10,7 @@ authors or trademark holders.*
 
 ```hocon
 dependencies {
-  fat { git = "github.com/sysl-lang/fat", version = "0.2.1" }
+  fat { git = "github.com/sysl-lang/fat", version = "0.3.0" }
 }
 ```
 
@@ -20,8 +20,15 @@ import sh.sysl.fat.format
 val g = format(&card, label = "CAMERA")?      // FAT16 up to 512 MiB, FAT32 above
 ```
 
-Nothing allocates except `RamDevice`, the in-memory test device: the volume reads through one sector the caller hands it, and a file's data
-goes straight into the caller's buffer.
+**Nothing allocates**: the volume reads through one sector the caller hands it, a file's data goes
+straight into the caller's buffer, and `RamDevice`, the in-memory device, works over storage the caller
+owns. The gate builds a `@no_alloc` program that formats, writes, reads and renames through all of it,
+a `RamDevice` included, for five bare-metal targets.
+
+```sysl
+var disk: [4194304]u8 = [0; 4194304]       // a static array on a board, a Buf on the host
+var ram = ram_device(disk[..])             // 8192 sectors of 512 bytes
+```
 
 ```sysl
 import sh.sysl.fat.{empty_entry, mount}
@@ -32,7 +39,7 @@ var v = mount(&card, sector[..])?
 var d = v.open_dir("/photos")?
 var e = empty_entry()
 while v.read_dir(&d, &e)?
-    print(e.name(), e.size)               // long names, as UTF-8
+    print(e.name(), e.size)               // long names, as UTF-8; size, first_cluster, attributes read-only
 
 var f = v.open("/photos/Summer holiday.jpg")?
 val n = v.read(&f, out)?
@@ -46,13 +53,23 @@ FAT32's free-cluster hint:
 ```sysl
 v.make_dir("/photos/2026")?
 var f = v.create("/photos/2026/Holiday at the lake.jpg")?
-v.write(&f, jpeg)?                        // grows the file and its chain as it goes
+val n = v.write(&f, jpeg)?                // grows the file and its chain as it goes
 v.truncate(&f, 1024)?
 v.rename("/photos/2026/Holiday at the lake.jpg", "/photos/Lake.jpg")?
 v.remove("/photos/old.jpg")?
 v.remove_dir("/photos/empty")?
 v.flush()?
 ```
+
+`write` answers as `sysl.io`'s `write_at` does: all of `data`, or a **short count** where the volume
+filled, the file reached 4 GiB less one byte, or the device failed part way, with the file's entry
+brought up to date for what landed. An error means nothing was written, so a caller wanting the rest
+writes again from the count and is told why then.
+
+Errors come in four enums, one per layer: `DeviceError` from a `BlockDevice` (`Io(code)` carries the
+driver's own code), `BootError` for a boot sector refused, `FormatError` from `format` and `plan`, and
+`VolumeError` from `mount` and everything a mounted volume does. A device failure reaches a volume's
+caller as `VolumeError.Device`, mounting included; a buffer of the wrong length is `BadLength` in each.
 
 A name in 8.3's shape is stored as one; any other gets a run of long-name entries and a unique 8.3
 name with a numeric tail (`HOLIDA~1.JPG`), as Windows and Linux write them. Entries are stamped from a
@@ -96,6 +113,10 @@ val header = read_exact_at(&at, 0, buffer)?
 at.write_at(4, size)?                     // past the end, the gap is filled with zeros
 at.sync()?                                // the volume's flush
 ```
+
+The on-disk structures and their helpers are the module's own (`private[fat]`); what a program sees is
+the volume API above, `format`/`plan`, `read_geometry`/`parse_boot_sector`, `Geometry`, the
+`ATTR_*` bits an entry's `attributes` holds, and the clock and device traits.
 
 ## mkfs.fat
 

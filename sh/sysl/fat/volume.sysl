@@ -8,12 +8,14 @@ import sysl.text.str_view
 // goes through that one sector; a file's data is read straight into the caller's buffer wherever it
 // fills whole sectors of it. Writing is in `write.sysl`.
 
-// Why a volume could not be read.
-enum FsError derives Eq, Display
+// Why a volume refused to mount, or an operation on a mounted one — a read, a write, a lookup —
+// failed. A device failure is `Device` however it was reached, mounting included; `Boot` is a boot
+// sector that was read and refused.
+enum VolumeError derives Eq, Display
     Device(error: DeviceError)
     Boot(error: BootError)
     // The buffer handed to `mount` is not one sector of the device's size.
-    BadBuffer
+    BadLength
     // A chain names a cluster outside the volume, a free one, or a bad one.
     BadCluster
     // A file's chain ends before its size does.
@@ -39,26 +41,32 @@ enum FsError derives Eq, Display
     // A write past the largest size a file can have, 4 GiB less one byte.
     TooLarge
 
-impl From[DeviceError] for FsError
-    from(e: DeviceError) -> FsError = FsError.Device(e)
+impl From[DeviceError] for VolumeError
+    from(e: DeviceError) -> VolumeError = VolumeError.Device(e)
 
-impl From[BootError] for FsError
-    from(e: BootError) -> FsError = FsError.Boot(e)
+// A device that failed while its boot sector was read is `Device`, as it is everywhere else, not a
+// boot sector refused.
+impl From[BootError] for VolumeError
+    from(e: BootError) -> VolumeError = e match
+        BootError.Device(d) -> VolumeError.Device(d)
+        _ -> VolumeError.Boot(e)
 
 // No sector: what the volume's buffer holds before the first read.
 private[fat] const NO_SECTOR: u64 = 0xFFFF_FFFF_FFFF_FFFF
 
 // A file or directory, as its directory entry says: its name, in UTF-8 — the long name when there is
 // one, the 8.3 name otherwise — and where its data is.
+//
+// What the volume reads back when the entry is opened — its attributes, first cluster and size — is
+// read-only outside the package, so an entry handed to `open_entry` is the one `read_dir` filled.
 struct Entry
     private[fat] name_bytes: [MAX_NAME_BYTES]u8
     private[fat] name_len: usize
     // The 8.3 name, as stored: eight bytes of base and three of extension, space-padded.
     short_name: [11]u8
-    attributes: u8
-    // The first cluster of its data; 0 for an empty file, and for a `..` entry naming the root.
-    first_cluster: u32
-    size: u32
+    private[fat] attribute_bits: u8
+    private[fat] start_cluster: u32
+    private[fat] byte_count: u32
     created_date: u16
     created_time: u16
     written_date: u16
@@ -76,7 +84,16 @@ struct Entry
     // filled again.
     name(*self) -> string = str_view(self.name_bytes[0..<self.name_len])
 
-    is_dir(self) -> bool = self.attributes & ATTR_DIRECTORY != 0
+    // The attribute bits (`ATTR_DIRECTORY`, `ATTR_READ_ONLY` and the rest).
+    attributes -> u8 = self.attribute_bits
+
+    // The first cluster of its data; 0 for an empty file, and for a `..` entry naming the root.
+    first_cluster -> u32 = self.start_cluster
+
+    // Its length in bytes; 0 for a directory.
+    size -> u32 = self.byte_count
+
+    is_dir(self) -> bool = self.attribute_bits & ATTR_DIRECTORY != 0
 end Entry
 
 // An entry with no name and nothing in it, to be filled by `read_dir`.
@@ -85,9 +102,9 @@ empty_entry() -> Entry
         name_bytes = [0; MAX_NAME_BYTES],
         name_len = 0,
         short_name = [0; 11],
-        attributes = 0,
-        first_cluster = 0,
-        size = 0,
+        attribute_bits = 0,
+        start_cluster = 0,
+        byte_count = 0,
         created_date = 0,
         created_time = 0,
         written_date = 0,
@@ -140,10 +157,11 @@ private[fat] dir_at(cluster: u32) -> Dir
         run_index = 0,
     )
 
-// An open file: where its data is, how long it is, and where the next read begins.
+// An open file: where its data is, how long it is, and where the next read begins. Only the volume
+// changes them: a size or a cluster set from outside would send the next read or write astray.
 struct File
-    first_cluster: u32
-    size: u32
+    private[fat] start_cluster: u32
+    private[fat] byte_count: u32
     private[fat] at: u32
     // The cluster last read or written, and which cluster of the chain it is; 0 when there is none yet.
     private[fat] cluster: u32
@@ -151,6 +169,12 @@ struct File
     // Where its directory entry is, which a write keeps up to date.
     private[fat] entry_sector: u64
     private[fat] entry_offset: usize
+
+    // The first cluster of its data; 0 while it is empty.
+    first_cluster -> u32 = self.start_cluster
+
+    // Its length in bytes.
+    size -> u32 = self.byte_count
 
     // Where the next read begins.
     position(self) -> u32 = self.at
@@ -165,8 +189,8 @@ private[fat] file_of(e: *Entry) -> File = new_file(e.first_cluster, e.size, e.se
 // A file at its start, with no cluster of its chain visited yet.
 private[fat] new_file(first_cluster: u32, size: u32, entry_sector: u64, entry_offset: usize) -> File
     File(
-        first_cluster = first_cluster,
-        size = size,
+        start_cluster = first_cluster,
+        byte_count = size,
         at = 0,
         cluster = 0,
         cluster_index = 0,
@@ -176,7 +200,7 @@ private[fat] new_file(first_cluster: u32, size: u32, entry_sector: u64, entry_of
 
 struct Volume[D: BlockDevice]
     private[fat] dev: *D
-    geometry: Geometry
+    private[fat] layout: Geometry
     private[fat] sector: []u8
     private[fat] loaded: u64
     // Whether the buffer holds a write not yet made to the device.
@@ -193,11 +217,15 @@ struct Volume[D: BlockDevice]
     private[fat] info_dirty: bool
     private[fat] clock: Option[*Clock]
 
+    // Where everything on the volume is, as its boot sector says. Read-only: the volume's reads and
+    // writes are placed by it.
+    geometry -> Geometry = self.layout
+
     // The root directory, from its first entry.
-    root(self) -> Dir = dir_at(if self.geometry.fat_type == FatType.Fat32 then self.geometry.root_cluster else 0)
+    root(*self) -> Dir = dir_at(if self.layout.fat_type == FatType.Fat32 then self.layout.root_cluster else 0)
 
     // Have the volume's buffer hold sector `s`.
-    private[fat] load(*self, s: u64) -> Result[unit, FsError]
+    private[fat] load(*self, s: u64) -> Result[unit, VolumeError]
         if self.loaded == s then return Ok(())
         self.write_back()?
         self.loaded = NO_SECTOR
@@ -210,25 +238,25 @@ struct Volume[D: BlockDevice]
 
     // The cluster after `c` in its chain, or `None` at the chain's end. A free, bad or reserved entry
     // inside a chain is an error, as is one naming a cluster past the volume's last.
-    next_cluster(*self, c: u32) -> Result[Option[u32], FsError]
-        if !self.holds(c) then return Err(FsError.BadCluster)
+    private[fat] next_cluster(*self, c: u32) -> Result[Option[u32], VolumeError]
+        if !self.holds(c) then return Err(VolumeError.BadCluster)
         val entry = self.fat_entry(c)?
         val end_of_chain = if self.geometry.fat_type == FatType.Fat32 then CHAIN_END_MIN32 else CHAIN_END_MIN16
         if entry >= end_of_chain then return Ok(None)
-        if !self.holds(entry) then return Err(FsError.BadCluster)
+        if !self.holds(entry) then return Err(VolumeError.BadCluster)
         Ok(Some(entry))
 
     // Load the FAT sector holding cluster `c`'s entry, and answer where in it the entry is.
-    private[fat] load_entry(*self, c: u32) -> Result[usize, FsError]
+    private[fat] load_entry(*self, c: u32) -> Result[usize, VolumeError]
         val g = self.geometry
-        val offset = u64(c) * (if g.fat_type == FatType.Fat32 then 4u64 else 2u64)
+        val offset = u64(c) * (if g.fat_type == FatType.Fat32 then 4 else 2)
         val bps = u64(g.bytes_per_sector)
         self.load(u64(g.fat_start(g.active_fat)) + offset / bps)?
         // An entry never straddles two sectors: 2 and 4 both divide every sector size.
         Ok(usize(offset % bps))
 
     // Cluster `c`'s FAT entry as it stands: FAT32's are 28 bits, and the top four, reserved, are left off.
-    private[fat] fat_entry(*self, c: u32) -> Result[u32, FsError]
+    private[fat] fat_entry(*self, c: u32) -> Result[u32, VolumeError]
         val at = self.load_entry(c)?
         val s = self.sector
         val low = u32(s[at]) | u32(s[at + 1]) << 8
@@ -239,7 +267,7 @@ struct Volume[D: BlockDevice]
     // volume label and long-name entries are passed over; a long name is the name of the short entry
     // after it only if its run is whole and its checksum is that entry's, and is dropped otherwise, as
     // every reader does. `.` and `..` are entries like any other.
-    read_dir(*self, d: *Dir, e: *Entry) -> Result[bool, FsError]
+    read_dir(*self, d: *Dir, e: *Entry) -> Result[bool, VolumeError]
         val g = self.geometry
         val per_sector = g.bytes_per_sector / 32
         loop
@@ -255,7 +283,7 @@ struct Volume[D: BlockDevice]
                     self.next_cluster(d.cluster)? match
                         Some(n) ->
                             d.steps += 1
-                            if d.steps >= g.clusters then return Err(FsError.ChainLoop)
+                            if d.steps >= g.clusters then return Err(VolumeError.ChainLoop)
                             d.cluster = n
                             d.index = 0
                         None ->
@@ -282,10 +310,10 @@ struct Volume[D: BlockDevice]
                 continue
 
             e.short_name = raw.name
-            e.attributes = raw.attributes
-            e.first_cluster = if g.fat_type == FatType.Fat32 then u32(raw.first_cluster_high) << 16 | u32(raw.first_cluster_low)
+            e.attribute_bits = raw.attributes
+            e.start_cluster = if g.fat_type == FatType.Fat32 then u32(raw.first_cluster_high) << 16 | u32(raw.first_cluster_low)
                               else u32(raw.first_cluster_low)
-            e.size = raw.size
+            e.byte_count = raw.size
             e.created_date = raw.created_date
             e.created_time = raw.created_time
             e.written_date = raw.written_date
@@ -304,22 +332,22 @@ struct Volume[D: BlockDevice]
 
     // The directory an entry names. A `..` entry naming the root has cluster 0, and so does FAT16's
     // root; FAT32's root is a cluster like any other.
-    open_dir_entry(self, e: *Entry) -> Result[Dir, FsError]
-        if !e.is_dir() then return Err(FsError.NotADirectory)
+    open_dir_entry(*self, e: *Entry) -> Result[Dir, VolumeError]
+        if !e.is_dir() then return Err(VolumeError.NotADirectory)
         if e.first_cluster == 0 then return Ok(self.root())
-        if !self.holds(e.first_cluster) then return Err(FsError.BadCluster)
+        if !self.holds(e.first_cluster) then return Err(VolumeError.BadCluster)
         Ok(dir_at(e.first_cluster))
 
     // The file an entry names.
-    open_entry(self, e: *Entry) -> Result[File, FsError]
-        if e.is_dir() then return Err(FsError.IsADirectory)
-        if e.size != 0 && !self.holds(e.first_cluster) then return Err(FsError.BadCluster)
+    open_entry(*self, e: *Entry) -> Result[File, VolumeError]
+        if e.is_dir() then return Err(VolumeError.IsADirectory)
+        if e.size != 0 && !self.holds(e.first_cluster) then return Err(VolumeError.BadCluster)
         Ok(file_of(e))
 
     // Fill `e` with the entry `path` names: names separated by `/`, a leading `/` or none, each matched
     // against both an entry's long name and its 8.3 one without regard to the case of ASCII letters. `.`
     // is the directory it is in, and `..` its parent (the root's is the root).
-    find(*self, path: string, e: *Entry) -> Result[unit, FsError]
+    find(*self, path: string, e: *Entry) -> Result[unit, VolumeError]
         var d = self.root()
         var at_root = true
         var found = false
@@ -342,30 +370,30 @@ struct Volume[D: BlockDevice]
             while !matched && self.read_dir(&d, e)?
                 val n = short_display(e.short_name, 0, short[..])
                 matched = same_name(e.name_bytes[0..<e.name_len], part) || same_name(short[0..<n], part)
-            if !matched then return Err(FsError.NotFound)
+            if !matched then return Err(VolumeError.NotFound)
             found = true
             // A `..` naming the root says cluster 0; some writers put FAT32's root cluster there instead.
             at_root = e.is_dir() && (e.first_cluster == 0 || e.first_cluster == self.geometry.root_cluster)
-        if !found then return Err(FsError.BadPath)
+        if !found then return Err(VolumeError.BadPath)
         Ok(())
 
     // The directory `path` names; an empty path, or `/`, is the root.
-    open_dir(*self, path: string) -> Result[Dir, FsError]
+    open_dir(*self, path: string) -> Result[Dir, VolumeError]
         var e = empty_entry()
         self.find(path, &e) match
             Ok(()) -> self.open_dir_entry(&e)
-            Err(FsError.BadPath) -> Ok(self.root())
+            Err(VolumeError.BadPath) -> Ok(self.root())
             Err(other) -> Err(other)
 
     // The file `path` names.
-    open(*self, path: string) -> Result[File, FsError]
+    open(*self, path: string) -> Result[File, VolumeError]
         var e = empty_entry()
         self.find(path, &e)?
         self.open_entry(&e)
 
     // Read from `f` into `out` from its position on, answering how many bytes were read: as many as
     // `out` holds, or fewer at the file's end, where it answers 0.
-    read(*self, f: *File, out: []u8) -> Result[usize, FsError]
+    read(*self, f: *File, out: []u8) -> Result[usize, VolumeError]
         val g = self.geometry
         val bps = g.bytes_per_sector
         val cluster_bytes = g.cluster_bytes()
@@ -375,7 +403,7 @@ struct Volume[D: BlockDevice]
             // it, from the chain's start otherwise.
             val want = f.at / cluster_bytes
             if f.cluster == 0 || want < f.cluster_index
-                if !self.holds(f.first_cluster) then return Err(FsError.BadCluster)
+                if !self.holds(f.first_cluster) then return Err(VolumeError.BadCluster)
                 f.cluster = f.first_cluster
                 f.cluster_index = 0
             while f.cluster_index < want
@@ -383,7 +411,7 @@ struct Volume[D: BlockDevice]
                     Some(n) ->
                         f.cluster = n
                         f.cluster_index += 1
-                    None -> return Err(FsError.ChainTooShort)
+                    None -> return Err(VolumeError.ChainTooShort)
             val within = f.at % cluster_bytes
             val sector = u64(g.cluster_start(f.cluster) + within / bps)
             val offset = within % bps
@@ -426,25 +454,25 @@ private gather(d: *Dir, l: *LongNameEntry)
         d.drop_long_name()
         return
     val base = (usize(order) - 1) * 13
-    for k in 0usize..<5
+    for k in 0..<5
         d.units[base + k] = l.name1[k].unit
-    for k in 0usize..<6
+    for k in 0..<6
         d.units[base + 5 + k] = l.name2[k].unit
-    for k in 0usize..<2
+    for k in 0..<2
         d.units[base + 11 + k] = l.name3[k].unit
     d.expect = order - 1
 
 // Mount the volume on `dev`, reading and writing through `sector`, which is one sector of the device's
 // size and is the volume's from now on.
-mount[D: BlockDevice](dev: *D, sector: []u8) -> Result[Volume[D], FsError]
-    if sector.len != dev.sector_size() then return Err(FsError.BadBuffer)
+mount[D: BlockDevice](dev: *D, sector: []u8) -> Result[Volume[D], VolumeError]
+    if sector.len != dev.sector_size() then return Err(VolumeError.BadLength)
     val g = read_geometry(dev, sector)?
     // The boot sector is still in the buffer: bit 7 of FAT32's flags turns mirroring off.
     val tail: *Fat32Tail = at(sector, TAIL_OFFSET)
     val mirrored = g.fat_type != FatType.Fat32 || tail.ext_flags & 0x80 == 0
     var v = Volume(
         dev = dev,
-        geometry = g,
+        layout = g,
         sector = sector,
         loaded = NO_SECTOR,
         dirty = false,

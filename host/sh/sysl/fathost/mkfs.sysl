@@ -20,8 +20,9 @@ format_message(e: FormatError) -> string = e match
     FormatError.TooSmall -> "the volume is too small for the FAT type (4.1 MB is FAT16's least; FAT32's is 32.5 MB)"
     FormatError.TooLarge -> "the volume is too large for the FAT type (FAT16 ends at 2 GiB; FAT32 at 2^32 sectors)"
     FormatError.BadClusterSize -> "the cluster size must be a power of two sectors, of at most 32 KiB"
-    FormatError.ClusterCountOutOfRange -> "that cluster size gives a count of clusters outside the FAT type's range"
+    FormatError.BadClusterCount -> "that cluster size gives a count of clusters outside the FAT type's range"
     FormatError.BadLabel -> "a label is 1 to 11 characters, none of them \" * + , . / : ; < = > ? [ \\ ] |"
+    FormatError.Unsupported -> "FAT12 is not written; the type is 16 or 32"
 
 // A whole decimal number, or a hexadecimal one after `0x` (or, with `hex`, without it).
 private number(text: string, hex: bool = false) -> Option[u64]

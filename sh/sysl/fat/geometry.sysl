@@ -14,21 +14,24 @@ enum FatType derives Display
     Fat32
 
 // Fewer clusters than this is FAT12; fewer than `FAT32_MIN_CLUSTERS` is FAT16; the rest are FAT32.
-const FAT16_MIN_CLUSTERS: u32 = 4085
-const FAT32_MIN_CLUSTERS: u32 = 65525
+private[fat] const FAT16_MIN_CLUSTERS: u32 = 4085
+private[fat] const FAT32_MIN_CLUSTERS: u32 = 65525
 
 // The most data clusters a FAT32 volume may have: cluster numbers past 0x0FFF_FFF6 are reserved.
-const FAT32_MAX_CLUSTERS: u32 = 0x0FFF_FFF5
+private[fat] const FAT32_MAX_CLUSTERS: u32 = 0x0FFF_FFF5
 
 // The type a volume of `clusters` data clusters is (spec section 3.5).
-fat_type_of(clusters: u32) -> FatType =
+private[fat] fat_type_of(clusters: u32) -> FatType =
     if clusters < FAT16_MIN_CLUSTERS then FatType.Fat12
     else if clusters < FAT32_MIN_CLUSTERS then FatType.Fat16
     else FatType.Fat32
 
-// Why a boot sector was refused.
+// Why a boot sector was refused. A variant names the first field found wrong; `BadLength` is the buffer
+// handed in, not the volume.
 enum BootError derives Eq, Display
     Device(error: DeviceError)
+    // The buffer holding the boot sector is shorter than 512 bytes.
+    BadLength
     NoSignature
     BadJump
     BadSectorSize
@@ -47,7 +50,8 @@ enum BootError derives Eq, Display
     BadVersion
     BadRootCluster
     BadActiveFat
-    Fat12
+    // A FAT12 volume, which the package recognises and does not read.
+    Unsupported
 
 impl From[DeviceError] for BootError
     from(e: DeviceError) -> BootError = BootError.Device(e)
@@ -100,7 +104,7 @@ read_geometry[D: BlockDevice](dev: *D, scratch: []u8) -> Result[Geometry, BootEr
 // the volume's geometry. Every check is one the spec states; the order is the order the numbers are
 // derived in, so the error names the first field that is wrong.
 parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Result[Geometry, BootError]
-    if sector.len < 512 then return Err(BootError.BadSectorSize)
+    if sector.len < 512 then return Err(BootError.BadLength)
     if sector[SIGNATURE_OFFSET] != SIGNATURE[0] || sector[SIGNATURE_OFFSET + 1] != SIGNATURE[1]
         return Err(BootError.NoSignature)
     val b: *BootSector = at(sector, 0)
@@ -140,7 +144,7 @@ parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Resu
     // count, so the small FAT32 volumes mtools and `mkfs.fat -F 32` will make (with a warning) still
     // read. The layout says unambiguously where everything is; `format` never makes such a volume.
     val kind = if b.fat_size16 == 0 then FatType.Fat32 else fat_type_of(clusters)
-    if kind == FatType.Fat12 then return Err(BootError.Fat12)
+    if kind == FatType.Fat12 then return Err(BootError.Unsupported)
     // FAT32 has no fixed root directory; FAT16 needs one, and its 16-bit entries cannot number FAT32's
     // count of clusters.
     val laid_out_right = if kind == FatType.Fat32 then b.fat_size16 == 0 && root_entries == 0 && clusters <= FAT32_MAX_CLUSTERS
@@ -148,7 +152,7 @@ parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Resu
     if !laid_out_right then return Err(BootError.TypeMismatch)
 
     // Every cluster, plus the two reserved entries, has its entry inside one FAT.
-    val entry_bytes = if kind == FatType.Fat32 then 4u64 else 2u64
+    val entry_bytes: u64 = if kind == FatType.Fat32 then 4 else 2
     if u64(fat_sectors) * u64(bps) < (u64(clusters) + 2) * entry_bytes then return Err(BootError.FatTooSmall)
 
     var active_fat = 0u32
@@ -179,6 +183,24 @@ parse_boot_sector(sector: []u8, sector_size: usize, device_sectors: u64) -> Resu
             volume_id = t16.volume_id
             label = t16.label
 
-    Ok(Geometry(kind, bps, spc, reserved, fats, fat_sectors, active_fat, root_entries, root_dir_sectors, total,
-                first_data, clusters, root_cluster, fs_info, backup, b.hidden_sectors, media, volume_id,
-                label))
+    Ok(Geometry(
+        fat_type = kind,
+        bytes_per_sector = bps,
+        sectors_per_cluster = spc,
+        reserved_sectors = reserved,
+        fat_count = fats,
+        fat_sectors = fat_sectors,
+        active_fat = active_fat,
+        root_entries = root_entries,
+        root_dir_sectors = root_dir_sectors,
+        total_sectors = total,
+        first_data_sector = first_data,
+        clusters = clusters,
+        root_cluster = root_cluster,
+        fs_info_sector = fs_info,
+        backup_boot_sector = backup,
+        hidden_sectors = b.hidden_sectors,
+        media = media,
+        volume_id = volume_id,
+        label = label,
+    ))

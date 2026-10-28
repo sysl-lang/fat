@@ -15,7 +15,7 @@ private struct BulkDevice
     lens: Buf[usize]
     left: Option[u32]
 
-private bulk_device(sectors: u64) -> BulkDevice = BulkDevice(ram_device(sectors), 0, 0, 0, buf(), buf(), None)
+private bulk_device(sectors: u64) -> BulkDevice = BulkDevice(ram(sectors), 0, 0, 0, buf(), buf(), None)
 
 impl BlockDevice for BulkDevice
     sector_size(self) -> usize = self.inner.sector_size()
@@ -36,7 +36,7 @@ impl BlockDevice for BulkDevice
                 val take = if usize(n) * size < bytes.len then usize(n) * size else bytes.len
                 self.inner.write_many(sector, bytes[..<take])?
                 self.left = Some(n - u32(take / size))
-                if take < bytes.len then return Err(DeviceError.Io)
+                if take < bytes.len then return Err(DeviceError.Io(0))
                 Ok(())
             None -> self.inner.write_many(sector, bytes)
 
@@ -66,7 +66,8 @@ impl BlockDevice for CutWrites
     sectors(self) -> u64 = self.inner.sectors()
     read(*self, sector: u64, out: []u8) -> Result[unit, DeviceError] = self.inner.read(sector, out)
     write(*self, sector: u64, bytes: []const u8) -> Result[unit, DeviceError]
-        if self.left == 0 then return Err(DeviceError.Io)
+        // A driver's own code, which must reach the volume's caller unchanged.
+        if self.left == 0 then return Err(DeviceError.Io(7))
         self.left -= 1
         self.inner.write(sector, bytes)
     flush(*self) -> Result[unit, DeviceError] = self.inner.flush()
@@ -78,7 +79,7 @@ private pattern(n: usize, seed: usize) -> Buf[u8]
 
 @test("bulk block I/O: default methods validate the entire span, preserve data and accept empty requests at EOF")
 default_bulk()
-    var dev = ram_device(8)
+    var dev = ram(8)
     var bytes: [1024]u8 = [0; 1024]
     for i in 0..<1024 do bytes[i] = u8(i * 7)
     dev.write_many(6, bytes[..]).unwrap()
@@ -92,7 +93,7 @@ default_bulk()
 
 @test("bulk block I/O: a refused span moves nothing, and a span reaching the top of u64 does not wrap")
 refused_spans()
-    var dev = ram_device(8)
+    var dev = ram(8)
     val ones: [1024]u8 = [1; 1024]
     assert(dev.write_many(7, ones[..]).err() == Some(DeviceError.OutOfRange))
     var out: [1024]u8 = [9; 1024]
@@ -104,9 +105,9 @@ refused_spans()
 
 @test("bulk block I/O: the default write_many stops at the first failed sector and reports it")
 default_cut()
-    var dev = CutWrites(ram_device(8), 1)
+    var dev = CutWrites(ram(8), 1)
     val ones: [1536]u8 = [1; 1536]
-    assert(dev.write_many(2, ones[..]).err() == Some(DeviceError.Io))
+    assert(dev.write_many(2, ones[..]).err() == Some(DeviceError.Io(7)))
     var out: [512]u8
     dev.read(2, out[..]).unwrap()
     for b in out do assert(b == 1)
@@ -178,7 +179,7 @@ volume_bulk_cut()
     val new = pattern(2048, 4)
     dev.left = Some(1)
     file.seek(0)
-    assert(volume.write(&file, new.view()).err() == Some(FsError.Device(DeviceError.Io)))
+    assert(volume.write(&file, new.view()).err() == Some(VolumeError.Device(DeviceError.Io(0))))
     dev.left = None
     file.seek(0)
     volume.read(&file, few[..]).unwrap()
@@ -190,11 +191,68 @@ volume_bulk_cut()
 
 @test("FAT bulk I/O: a write over the default loop cut part way reports the device's error")
 volume_default_cut()
-    var dev = CutWrites(ram_device(32768), 0xFFFF_FFFF)
+    var dev = CutWrites(ram(32768), 0xFFFF_FFFF)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var volume = mount(&dev, cache[..]).unwrap()
     var file = volume.create("CUT.BIN").unwrap()
     volume.flush().unwrap()
     dev.left = 3
-    assert(volume.write(&file, pattern(8192, 5).view()).err() == Some(FsError.Device(DeviceError.Io)))
+    assert(volume.write(&file, pattern(8192, 5).view()).err() == Some(VolumeError.Device(DeviceError.Io(7))))
+
+@test("FAT bulk I/O: a device failing after whole clusters landed answers the short count, and the next write the error")
+volume_cut_short()
+    var dev = CutWrites(ram(32768), 0xFFFF_FFFF)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    var file = volume.create("SHORT.BIN").unwrap()
+    volume.flush().unwrap()
+    val cluster = usize(volume.geometry.cluster_bytes())
+    val data = pattern(4 * cluster, 6)
+    dev.left = 8
+    val n = volume.write(&file, data.view()).unwrap()
+    assert(n > 0 && n < data.len() && n % cluster == 0)
+    assert(file.size == u32(n) && file.position() == u32(n))
+    dev.left = 0
+    assert(volume.write(&file, data.view()[n..]).err() == Some(VolumeError.Device(DeviceError.Io(7))))
+    dev.left = 0xFFFF_FFFF
+    file.seek(0)
+    var out: Buf[u8] = buf()
+    for _ in 0..<n do out.push(0)
+    assert(volume.read(&file, out.view()).unwrap() == n)
+    for i in 0..<n do assert(out[i] == data[i])
+
+@test("RamDevice: reads and writes the caller's storage in place, whole sectors of it, and refuses past its end")
+ram_device_storage()
+    var storage: [1300]u8 = [0; 1300]
+    var dev = ram_device(storage[..])
+    assert(dev.sectors() == 2 && dev.sector_size() == 512)
+    assert(dev.image().len == 1024)
+    val ones: [512]u8 = [1; 512]
+    dev.write(1, ones[..]).unwrap()
+    for i in 0..<1300 do assert(storage[i] == (if i >= 512 && i < 1024 then 1 else 0))
+    storage[0] = 9
+    var out: [512]u8 = [0; 512]
+    dev.read(0, out[..]).unwrap()
+    assert(out[0] == 9)
+    assert(dev.read(2, out[..]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.write(2, ones[..]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.read(0, out[..<511]).err() == Some(DeviceError.BadLength))
+    assert(dev.write(0, ones[..<100]).err() == Some(DeviceError.BadLength))
+    var big = ram_device(storage[..], 1024)
+    assert(big.sectors() == 1 && big.sector_size() == 1024)
+
+@test("RamDevice: storage shorter than a sector, and a sector size of 0, make a device with no sectors")
+ram_device_empty()
+    var small: [100]u8 = [0; 100]
+    var a = ram_device(small[..])
+    assert(a.sectors() == 0 && a.image().len == 0)
+    var out: [512]u8 = [0; 512]
+    assert(a.read(0, out[..]).err() == Some(DeviceError.OutOfRange))
+    assert(format(&a).err() == Some(FormatError.TooSmall))
+    var b = ram_device(small[..], 0)
+    assert(b.sectors() == 0 && b.sector_size() == 0)
+    assert(b.read(0, out[..<0]).err() == Some(DeviceError.OutOfRange))
+    assert(b.read_many(0, out[..]).err() == Some(DeviceError.BadLength))
+    assert(format(&b).err() == Some(FormatError.BadSectorSize))

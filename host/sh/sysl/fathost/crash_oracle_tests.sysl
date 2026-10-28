@@ -2,7 +2,7 @@ module sh.sysl.fathost
 @tests
 @requires(os)
 
-import sh.sysl.fat.{BlockDevice, DeviceError, FatType, FsError, Volume, empty_entry, format, mount}
+import sh.sysl.fat.{BlockDevice, DeviceError, FatType, VolumeError, Volume, empty_entry, format, mount}
 import sysl.buf.{Buf, buf, buf_filled}
 import sysl.fs.{copy_file, exists, make_temp_dir, remove_dir_all}
 import sysl.process.{Var, capture}
@@ -31,7 +31,7 @@ impl BlockDevice for CutImage
     read(*self, s: u64, out: []u8) -> Result[unit, DeviceError] = self.image.read(s, out)
     write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
         if self.cutting
-            if self.left == 0 then return Err(DeviceError.Io)
+            if self.left == 0 then return Err(DeviceError.Io(0))
             self.left -= 1
         self.writes += 1
         self.image.write(s, data)
@@ -123,7 +123,7 @@ private set_up(op: Op, v: *Volume[CutImage])
             write_new(v, "src/moving dir/inside.bin", 3000, 7)
         _ -> ()
 
-private act[D: BlockDevice](op: Op, v: *Volume[D]) -> Result[unit, FsError]
+private act[D: BlockDevice](op: Op, v: *Volume[D]) -> Result[unit, VolumeError]
     op match
         Op.Create -> v.create("a new file with a long name.txt")?
         Op.Append | Op.AppendFat32 ->

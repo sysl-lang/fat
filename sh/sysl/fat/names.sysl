@@ -8,15 +8,15 @@ import sysl.text.Ascii
 
 // The most UTF-16 units a run of long-name entries holds: twenty entries of thirteen. The spec allows a
 // name of 255 characters; a longer run is read as far as it goes rather than refused.
-const MAX_NAME_UNITS: usize = 260
+private[fat] const MAX_NAME_UNITS: usize = 260
 
 // The most UTF-8 bytes such a name can take: three per unit (a surrogate pair is two units and four
 // bytes).
-const MAX_NAME_BYTES: usize = 780
+private[fat] const MAX_NAME_BYTES: usize = 780
 
 // The checksum of an 8.3 name that every long-name entry before it carries, so a long name left behind
 // by a reader that knows nothing of them is recognised as no longer belonging to its short entry.
-short_name_checksum(name: [11]u8) -> u8
+private[fat] short_name_checksum(name: [11]u8) -> u8
     var sum = 0u8
     for b in name
         sum = ((sum & 1) << 7) + (sum >> 1) + b
@@ -25,7 +25,7 @@ short_name_checksum(name: [11]u8) -> u8
 // Code page 437, the OEM code page of the PCs FAT was written for and the one Linux, mtools and
 // dosfstools read short names in unless told otherwise: the characters of bytes 0x80-0xFF. The bytes
 // below are ASCII.
-val CP437_HIGH: [128]u16 = [
+private val CP437_HIGH: [128]u16 = [
     0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7,
     0x00EA, 0x00EB, 0x00E8, 0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5,
     0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9,
@@ -54,7 +54,7 @@ private put(out: []u8, len: usize, c: char) -> usize = len + encode_utf8(c, out[
 // four bytes, and the dot): the base and extension with their padding taken off and a dot between them
 // when there is an extension, each lowered where `case_bits` (the entry's `nt_reserved`) says so.
 // Answers the length.
-short_display(name: [11]u8, case_bits: u8, out: []u8) -> usize
+private[fat] short_display(name: [11]u8, case_bits: u8, out: []u8) -> usize
     var len = 0usize
     var base_end = 8usize
     while base_end > 0 && name[base_end - 1] == u8(' ')
@@ -77,7 +77,7 @@ short_display(name: [11]u8, case_bits: u8, out: []u8) -> usize
 // `units` (UTF-16) into `out` as UTF-8 (at least three bytes a unit), up to the first NUL unit, which
 // ends a name shorter than its entries. A surrogate without its partner is U+FFFD, the replacement
 // character. Answers the length.
-utf16_to_utf8(units: []const u16, out: []u8) -> usize
+private[fat] utf16_to_utf8(units: []const u16, out: []u8) -> usize
     var len = 0usize
     var i = 0usize
     while i < units.len && units[i] != 0
@@ -95,7 +95,7 @@ utf16_to_utf8(units: []const u16, out: []u8) -> usize
 
 // Whether two names are the same name on a FAT volume: equal but for the case of ASCII letters. This is
 // what Linux's vfat does with UTF-8 names; letters beyond ASCII must match exactly.
-same_name(a: []const u8, b: string) -> bool
+private[fat] same_name(a: []const u8, b: string) -> bool
     if a.len != b.len then return false
     for i in 0..<a.len
         if a[i].to_upper() != b[i].to_upper() then return false

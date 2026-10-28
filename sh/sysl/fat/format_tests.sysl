@@ -47,8 +47,8 @@ forced_fat16_rows()
     // The table's last row says "up to 2 GB", but 32 KiB clusters over all of 2 GiB come to 65,527 of
     // them, which is FAT32's count; the type rule wins, so FAT16 ends where the count reaches 65,525.
     check_choice(4194144, Some(FatType.Fat16), FatType.Fat16, 64)
-    assert_eq(refused(4194145, Some(FatType.Fat16)), FormatError.ClusterCountOutOfRange)
-    assert_eq(refused(4194304, Some(FatType.Fat16)), FormatError.ClusterCountOutOfRange)
+    assert_eq(refused(4194145, Some(FatType.Fat16)), FormatError.BadClusterCount)
+    assert_eq(refused(4194304, Some(FatType.Fat16)), FormatError.BadClusterCount)
     assert_eq(refused(4194305, Some(FatType.Fat16)), FormatError.TooLarge)
 
 @test("FAT32 asked for by name goes down to the table's 32.5 MB, with 512-byte clusters up to 260 MB")
@@ -62,7 +62,7 @@ forced_fat32_rows()
 too_small_and_too_large()
     assert_eq(refused(8400, None), FormatError.TooSmall)
     assert_eq(refused(100, None), FormatError.TooSmall)
-    assert_eq(refused(1_000_000, Some(FatType.Fat12)), FormatError.TooSmall)
+    assert_eq(refused(1_000_000, Some(FatType.Fat12)), FormatError.Unsupported)
     assert_eq(refused(0x1_0000_0000, None), FormatError.TooLarge)
 
 // Every plan's numbers hold together: the regions follow one another inside the volume, the count of
@@ -112,7 +112,7 @@ cluster_smaller_than_sector()
     check_consistent(g)
     // Under 268 MB, clusters of one 4096-byte sector are too few for FAT32, where the table's 512-byte
     // ones would have been enough: refused, not silently made FAT16.
-    assert_eq(plan(100_000_000 / 4096, 4096, Some(FatType.Fat32)).unwrap_err(), FormatError.ClusterCountOutOfRange)
+    assert_eq(plan(100_000_000 / 4096, 4096, Some(FatType.Fat32)).unwrap_err(), FormatError.BadClusterCount)
     assert_eq(plan(100000, 4096, cluster_bytes = 2048).unwrap_err(), FormatError.BadClusterSize)
 
 @test("an asked-for cluster size is used, and one that is not a power of two or is past 32 KiB is refused")
@@ -126,12 +126,12 @@ asked_for_cluster_size()
     check_consistent(small)
     // 4 KiB clusters over 512 MiB are 131,072 of them: FAT32's count, so FAT16 (the type 512 MiB gets
     // by itself) cannot have them.
-    assert_eq(plan(1048576, 512, cluster_bytes = 4096).unwrap_err(), FormatError.ClusterCountOutOfRange)
+    assert_eq(plan(1048576, 512, cluster_bytes = 4096).unwrap_err(), FormatError.BadClusterCount)
     assert_eq(plan(1048576, 512, cluster_bytes = 3000).unwrap_err(), FormatError.BadClusterSize)
     assert_eq(plan(1048576, 512, cluster_bytes = 65536).unwrap_err(), FormatError.BadClusterSize)
     // A cluster size that pushes the count out of the type's range is refused, not silently changed.
     assert_eq(plan(1048576, 512, Some(FatType.Fat32), cluster_bytes = 32768).unwrap_err(),
-              FormatError.ClusterCountOutOfRange)
+              FormatError.BadClusterCount)
 
 @test("a label is upper-cased and padded to eleven bytes; a long, empty or forbidden one is refused")
 labels()

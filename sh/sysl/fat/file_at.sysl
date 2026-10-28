@@ -14,20 +14,20 @@ struct FileAt[D: BlockDevice]
     file: File
 
 impl[D: BlockDevice] Positioned for FileAt[D]
-    type Error = FsError
+    type Error = VolumeError
 
-    extent(*self) -> Result[u64, FsError] = Ok(u64(self.file.size))
+    extent(*self) -> Result[u64, VolumeError] = Ok(u64(self.file.size))
 
 impl[D: BlockDevice] ReadAt for FileAt[D]
-    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, FsError]
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, VolumeError]
         if offset >= u64(self.file.size) then return Ok(into[..<0])
         self.file.seek(u32(offset))
         Ok(into[..<self.volume.read(&self.file, into)?])
 
 impl[D: BlockDevice] WriteAt for FileAt[D]
-    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, FsError]
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, VolumeError]
         if bytes.len == 0 then return Ok(0)
-        if offset > 0xFFFF_FFFF || u64(bytes.len) > 0xFFFF_FFFF - offset then return Err(FsError.TooLarge)
+        if offset > MAX_FILE_SIZE || u64(bytes.len) > MAX_FILE_SIZE - offset then return Err(VolumeError.TooLarge)
         self.file.seek(self.file.size)
         val zeros: [512]u8 = [0; 512]
         while u64(self.file.size) < offset
@@ -36,4 +36,4 @@ impl[D: BlockDevice] WriteAt for FileAt[D]
         self.file.seek(u32(offset))
         self.volume.write(&self.file, bytes)
 
-    override sync(*self) -> Result[unit, FsError] = self.volume.flush()
+    override sync(*self) -> Result[unit, VolumeError] = self.volume.flush()

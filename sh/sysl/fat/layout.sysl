@@ -7,17 +7,21 @@ import sysl.slices.as_mut_ptr
 // storage is the format's own bytes. The boot sector's fields are not on their natural boundaries
 // (`bytes_per_sector` is at offset 11), which is why every one is packed; each is read and written in
 // place through a pointer into a sector (`at[T]`), and its size is pinned by an `@assert`.
+//
+// All of it is the module's own: a user of the package reads a volume through `Volume`, `Entry` and
+// `File`, never through these bytes. The attribute bits are the exception, since `Entry.attributes`
+// hands them out.
 
 // A structure inside a sector's bytes: `T` at `offset`. The bounds are checked here; a packed struct
 // has no alignment to keep.
-at[T](bytes: []u8, offset: usize) -> *T
+private[fat] at[T](bytes: []u8, offset: usize) -> *T
     if offset + sizeof(T) > bytes.len then panic("sh.sysl.fat: a structure past the end of its sector")
     ptr_cast(usize(as_mut_ptr(bytes)) + offset)
 
 // The BIOS parameter block every FAT volume begins with (spec section 3.1), offsets 0-35.
 @packed
 @byte_order(little)
-struct BootSector
+private[fat] struct BootSector
     jump: [3]u8
     oem: [8]u8
     bytes_per_sector: u16
@@ -38,7 +42,7 @@ struct BootSector
 // What follows the BPB on a FAT12 or FAT16 volume (spec section 3.2), offsets 36-61.
 @packed
 @byte_order(little)
-struct Fat16Tail
+private[fat] struct Fat16Tail
     drive: u8
     reserved: u8
     boot_signature: u8
@@ -51,7 +55,7 @@ struct Fat16Tail
 // What follows the BPB on a FAT32 volume (spec section 3.3), offsets 36-89.
 @packed
 @byte_order(little)
-struct Fat32Tail
+private[fat] struct Fat32Tail
     fat_size32: u32
     ext_flags: u16
     version: u16
@@ -69,17 +73,17 @@ struct Fat32Tail
 @assert(sizeof(Fat32Tail) == 54, "the FAT32 extended BPB is 54 bytes")
 
 // Where each part begins, and the signature every boot sector ends its first 512 bytes with.
-const TAIL_OFFSET: usize = 36
-const SIGNATURE_OFFSET: usize = 510
-val SIGNATURE: [2]u8 = [0x55, 0xAA]
+private[fat] const TAIL_OFFSET: usize = 36
+private[fat] const SIGNATURE_OFFSET: usize = 510
+private[fat] val SIGNATURE: [2]u8 = [0x55, 0xAA]
 
 // The extended boot signature: it says the volume ID, label and type string after it are present.
-const EXTENDED_BOOT_SIGNATURE: u8 = 0x29
+private[fat] const EXTENDED_BOOT_SIGNATURE: u8 = 0x29
 
 // A 32-byte directory entry (spec section 6).
 @packed
 @byte_order(little)
-struct DirEntry
+private[fat] struct DirEntry
     name: [11]u8
     attributes: u8
     nt_reserved: u8
@@ -98,7 +102,7 @@ struct DirEntry
 // One UTF-16 code unit of a long name, kept little-endian.
 @packed
 @byte_order(little)
-struct Utf16Unit
+private[fat] struct Utf16Unit
     unit: u16
 
 // A long-name entry: thirteen UTF-16 units of a name too long or too varied for an 8.3 one, in three
@@ -107,7 +111,7 @@ struct Utf16Unit
 // numbers the pieces from 1, and the first entry of the run has `LAST_LONG_ENTRY` set in it too.
 @packed
 @byte_order(little)
-struct LongNameEntry
+private[fat] struct LongNameEntry
     order: u8
     name1: [5]Utf16Unit
     attributes: u8
@@ -120,28 +124,28 @@ struct LongNameEntry
 @assert(sizeof(LongNameEntry) == 32, "a long-name entry is 32 bytes")
 
 // The attribute byte that marks a long-name entry, and the order bit that marks a run's first entry.
-const ATTR_LONG_NAME: u8 = 0x0F
-const LAST_LONG_ENTRY: u8 = 0x40
+private[fat] const ATTR_LONG_NAME: u8 = 0x0F
+private[fat] const LAST_LONG_ENTRY: u8 = 0x40
 // The attribute bits that identify a long-name entry; the top two are reserved.
-const ATTR_LONG_NAME_MASK: u8 = 0x3F
+private[fat] const ATTR_LONG_NAME_MASK: u8 = 0x3F
 // A long-name entry's order number, without `LAST_LONG_ENTRY`.
-const LONG_ORDER_MASK: u8 = 0x3F
+private[fat] const LONG_ORDER_MASK: u8 = 0x3F
 // The first value of a FAT entry that ends a cluster chain.
-const CHAIN_END_MIN16: u32 = 0xFFF8
-const CHAIN_END_MIN32: u32 = 0x0FFF_FFF8
+private[fat] const CHAIN_END_MIN16: u32 = 0xFFF8
+private[fat] const CHAIN_END_MIN32: u32 = 0x0FFF_FFF8
 
 // What the first byte of a short entry's name says when it is not the name's first character: a free
 // entry, the end of the directory, and a name that really begins with 0xE5 (which is kept as 0x05).
-const ENTRY_FREE: u8 = 0xE5
-const ENTRY_END: u8 = 0x00
-const ENTRY_E5: u8 = 0x05
+private[fat] const ENTRY_FREE: u8 = 0xE5
+private[fat] const ENTRY_END: u8 = 0x00
+private[fat] const ENTRY_E5: u8 = 0x05
 
 // The bits of `nt_reserved` that Windows NT and every later reader take to mean an 8.3 name's base or
 // extension is shown in lower case.
-const LOWER_BASE: u8 = 0x08
-const LOWER_EXT: u8 = 0x10
+private[fat] const LOWER_BASE: u8 = 0x08
+private[fat] const LOWER_EXT: u8 = 0x10
 
-// The attribute bits of a directory entry.
+// The attribute bits of a directory entry, as `Entry.attributes` holds them.
 const ATTR_READ_ONLY: u8 = 0x01
 const ATTR_HIDDEN: u8 = 0x02
 const ATTR_SYSTEM: u8 = 0x04
@@ -152,7 +156,7 @@ const ATTR_ARCHIVE: u8 = 0x20
 // The FAT32 FSInfo sector (spec section 5): a hint of the free cluster count and where to look for one.
 @packed
 @byte_order(little)
-struct FsInfo
+private[fat] struct FsInfo
     lead_signature: u32
     reserved: [480]u8
     struct_signature: u32
@@ -163,9 +167,9 @@ struct FsInfo
 
 @assert(sizeof(FsInfo) == 512, "the FSInfo structure fills a 512-byte sector")
 
-const FSINFO_LEAD: u32 = 0x4161_5252
-const FSINFO_STRUCT: u32 = 0x6141_7272
-const FSINFO_TRAIL: u32 = 0xAA55_0000
+private[fat] const FSINFO_LEAD: u32 = 0x4161_5252
+private[fat] const FSINFO_STRUCT: u32 = 0x6141_7272
+private[fat] const FSINFO_TRAIL: u32 = 0xAA55_0000
 
 // "Not known" in either of FSInfo's counts.
-const FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF
+private[fat] const FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF

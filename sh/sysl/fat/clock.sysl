@@ -17,7 +17,7 @@ trait Clock
     now(self) -> Stamp
 
 // 1980-01-01 00:00:00, the earliest time FAT can hold: year 0, month 1, day 1.
-val EPOCH: Stamp = Stamp(0x0021, 0, 0)
+private[fat] val EPOCH: Stamp = Stamp(0x0021, 0, 0)
 
 // The stamp of a time, given as the calendar has it. A year before 1980 is 1980 and one past 2107 is
 // 2107, the years seven bits hold; the other fields are taken as they are.

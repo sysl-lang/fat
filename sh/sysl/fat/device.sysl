@@ -1,6 +1,5 @@
 module sh.sysl.fat
 
-import sysl.buf.{Buf, buf_filled}
 import sysl.slices.copy
 
 // The block device everything in the package is written against: whole sectors, read and written by
@@ -11,10 +10,15 @@ import sysl.slices.copy
 // implementations. The sector size is the device's: a volume whose boot sector names another is refused
 // rather than translated.
 
-enum DeviceError derives Display
+// Why a device refused a read, a write or a flush.
+enum DeviceError derives Eq, Display
+    // A sector at or past the device's end.
     OutOfRange
+    // A buffer that is not a whole number of sectors (one sector, for `read` and `write`).
     BadLength
-    Io
+    // The device failed. `code` is the driver's own word for how (an SD card's timeout and its CRC
+    // error are two codes), so the cause survives the trip through the volume; 0 when it has none.
+    Io(code: u32)
 
 trait BlockDevice
     // The bytes in one sector: 512, 1024, 2048 or 4096.
@@ -60,19 +64,22 @@ private span(size: usize, total: u64, sector: u64, len: usize) -> Result[u64, De
     if sector > total || count > total - sector then return Err(DeviceError.OutOfRange)
     Ok(count)
 
-// A device in memory, for tests and RAM disks. Unlike the rest of the package it allocates: its
-// sectors are one `Buf`.
+// A device in memory, for RAM disks and tests, over storage the caller owns: a static array on a board,
+// a `Buf` on the host. It allocates nothing, as nothing else in the package does.
 struct RamDevice
-    private bytes: Buf[u8]
+    private bytes: []u8
     private size: usize
     private count: u64
 
     // Every byte the device holds, for a test that looks at the raw image.
-    image(self) -> []const u8 = self.bytes.view()
+    image(self) -> []const u8 = self.bytes
 
-// A zero-filled device of `sectors` sectors of `sector_size` bytes.
-ram_device(sectors: u64, sector_size: usize = 512) -> RamDevice
-    RamDevice(buf_filled(usize(sectors) * sector_size, 0), sector_size, sectors)
+// A device over `storage`, in sectors of `sector_size` bytes: as many whole sectors as it holds, any
+// bytes left over unused. Its contents are what `storage` holds; a fresh device for `format` need not
+// be zeroed. A `sector_size` of 0 makes a device with no sectors.
+ram_device(storage: []u8, sector_size: usize = 512) -> RamDevice
+    val count = if sector_size == 0 then 0 else storage.len / sector_size
+    RamDevice(storage[..<count * sector_size], sector_size, u64(count))
 
 impl BlockDevice for RamDevice
     sector_size(self) -> usize = self.size
@@ -82,14 +89,14 @@ impl BlockDevice for RamDevice
         if out.len != self.size then return Err(DeviceError.BadLength)
         if s >= self.count then return Err(DeviceError.OutOfRange)
         val at = usize(s) * self.size
-        copy(out, self.bytes.view()[at..<at + self.size])
+        copy(out, self.bytes[at..<at + self.size])
         Ok(())
 
     write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
         if data.len != self.size then return Err(DeviceError.BadLength)
         if s >= self.count then return Err(DeviceError.OutOfRange)
         val at = usize(s) * self.size
-        copy(self.bytes.view()[at..<at + self.size], data)
+        copy(self.bytes[at..<at + self.size], data)
         Ok(())
 
     flush(*self) -> Result[unit, DeviceError] = Ok(())

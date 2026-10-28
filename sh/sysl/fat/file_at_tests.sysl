@@ -13,13 +13,13 @@ impl BlockDevice for Failing
     sector_size(self) -> usize = self.inner.sector_size()
     sectors(self) -> u64 = self.inner.sectors()
     read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
-        if self.failing then return Err(DeviceError.Io)
+        if self.failing then return Err(DeviceError.Io(0))
         self.inner.read(s, out)
     write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
-        if self.failing then return Err(DeviceError.Io)
+        if self.failing then return Err(DeviceError.Io(0))
         self.inner.write(s, data)
     flush(*self) -> Result[unit, DeviceError]
-        if self.failing then return Err(DeviceError.Io)
+        if self.failing then return Err(DeviceError.Io(0))
         self.inner.flush()
 
 private bytes(n: usize, seed: usize) -> Buf[u8]
@@ -34,7 +34,7 @@ private zeroed(n: usize) -> Buf[u8]
 
 @test("FileAt: bytes written at offsets read back at offsets, across sectors and clusters, and through a fresh open")
 file_at_round_trip()
-    var dev = ram_device(32768)
+    var dev = ram(32768)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var v = mount(&dev, cache[..]).unwrap()
@@ -57,7 +57,7 @@ file_at_round_trip()
 
 @test("FileAt: a read at or past the end answers empty, and an empty write takes nothing anywhere")
 file_at_ends()
-    var dev = ram_device(32768)
+    var dev = ram(32768)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var v = mount(&dev, cache[..]).unwrap()
@@ -74,7 +74,7 @@ file_at_ends()
 
 @test("FileAt: a write past the end fills the gap with zeros first, as pwrite does")
 file_at_gap()
-    var dev = ram_device(32768)
+    var dev = ram(32768)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var v = mount(&dev, cache[..]).unwrap()
@@ -91,20 +91,20 @@ file_at_gap()
 
 @test("FileAt: a write past 4 GiB less one byte is TooLarge, whatever the offset, and changes nothing")
 file_at_too_large()
-    var dev = ram_device(32768)
+    var dev = ram(32768)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var v = mount(&dev, cache[..]).unwrap()
     var at = FileAt(&v, v.create("BIG.BIN").unwrap())
     val one: [1]u8 = [1]
-    assert(at.write_at(0x1_0000_0000, one[..]).err() == Some(FsError.TooLarge))
-    assert(at.write_at(0xFFFF_FFFF, one[..]).err() == Some(FsError.TooLarge))
-    assert(at.write_at(0xFFFF_FFFF_FFFF_FFFF, one[..]).err() == Some(FsError.TooLarge))
+    assert(at.write_at(0x1_0000_0000, one[..]).err() == Some(VolumeError.TooLarge))
+    assert(at.write_at(0xFFFF_FFFF, one[..]).err() == Some(VolumeError.TooLarge))
+    assert(at.write_at(0xFFFF_FFFF_FFFF_FFFF, one[..]).err() == Some(VolumeError.TooLarge))
     assert(at.extent().unwrap() == 0)
 
-@test("FileAt: a device that fails reaches the caller as FsError.Device from read_at, write_at and sync")
+@test("FileAt: a device that fails reaches the caller as VolumeError.Device from read_at, write_at and sync")
 file_at_device_errors()
-    var dev = Failing(ram_device(32768), false)
+    var dev = Failing(ram(32768), false)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var v = mount(&dev, cache[..]).unwrap()
@@ -113,6 +113,19 @@ file_at_device_errors()
     at.sync().unwrap()
     dev.failing = true
     val out = zeroed(4096)
-    assert(at.read_at(0, out.view()).err() == Some(FsError.Device(DeviceError.Io)))
-    assert(at.write_at(0, bytes(4096, 7).view()).err() == Some(FsError.Device(DeviceError.Io)))
-    assert(at.sync().err() == Some(FsError.Device(DeviceError.Io)))
+    assert(at.read_at(0, out.view()).err() == Some(VolumeError.Device(DeviceError.Io(0))))
+    assert(at.write_at(0, bytes(4096, 7).view()).err() == Some(VolumeError.Device(DeviceError.Io(0))))
+    assert(at.sync().err() == Some(VolumeError.Device(DeviceError.Io(0))))
+
+@test("mount on a device that fails reading its boot sector is VolumeError.Device, as any other device failure is")
+mount_device_error()
+    var dev = Failing(ram(32768), false)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    dev.failing = true
+    var cache: [512]u8 = [0; 512]
+    assert(mount(&dev, cache[..]).err() == Some(VolumeError.Device(DeviceError.Io(0))))
+    // A boot sector read and refused is still `Boot`.
+    dev.failing = false
+    val blank: [512]u8 = [0; 512]
+    dev.write(0, blank[..]).unwrap()
+    assert(mount(&dev, cache[..]).err() == Some(VolumeError.Boot(BootError.NoSignature)))
