@@ -6,7 +6,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       fat { git = "github.com/sysl-lang/fat", version = "0.4.1" }
+//       fat { git = "github.com/sysl-lang/fat", version = "0.4.2" }
 //     }
 //
 // The module is `sh.sysl.fat`. The specification followed is Microsoft's "FAT: General Overview of
@@ -14,8 +14,8 @@
 
 package {
   name    = "fat"
-  version = "0.4.1"
-  sysl    = "0.7.9"
+  version = "0.4.2"
+  sysl    = "0.8.0"
 }
 
 // The workspace's other members: `host` is the package on the host (a block device over an image

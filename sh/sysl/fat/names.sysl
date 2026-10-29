@@ -20,7 +20,7 @@ private[fat] const MAX_NAME_BYTES: usize = 780
 private[fat] short_name_checksum(name: [11]u8) -> u8
     var sum = 0u8
     for b in name
-        sum = ((sum & 1) << 7) + (sum >> 1) + b
+        sum = ((sum & 1) << 7) +% (sum >> 1) +% b
     sum
 
 // Code page 437, the OEM code page of the PCs FAT was written for and the one Linux, mtools and

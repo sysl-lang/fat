@@ -81,7 +81,7 @@ private pattern(n: usize, seed: usize) -> Buf[u8]
 default_bulk()
     var dev = ram(8)
     var bytes: [1024]u8 = [0; 1024]
-    for i in 0..<1024 do bytes[i] = u8(i * 7)
+    for i in 0..<1024 do bytes[i] = u8.wrap(i * 7)
     dev.write_many(6, bytes[..]).unwrap()
     var out: [1024]u8
     dev.read_many(6, out[..]).unwrap()
@@ -124,7 +124,7 @@ volume_bulk()
     assert(cluster > 512)
     var file = volume.create("BULK.BIN").unwrap()
     var input: [8192]u8 = [0; 8192]
-    for i in 0..<8192 do input[i] = u8(i * 13)
+    for i in 0..<8192 do input[i] = u8.wrap(i * 13)
     assert(volume.write(&file, input[..]).unwrap() == input.len)
     assert(dev.writes > 0 && dev.largest == cluster)
     file.seek(0)
