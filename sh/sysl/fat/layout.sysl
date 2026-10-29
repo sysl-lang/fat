@@ -1,4 +1,5 @@
 module sh.sysl.fat
+@no_alloc
 
 import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr

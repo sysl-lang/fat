@@ -1,4 +1,5 @@
 module sh.sysl.fat
+@no_alloc
 
 import sysl.slices.copy
 

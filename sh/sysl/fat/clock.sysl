@@ -1,4 +1,5 @@
 module sh.sysl.fat
+@no_alloc
 
 // The times a directory entry keeps, and where they come from. A volume has no clock of its own: a
 // board, a kernel or the host hands it one (`Volume.set_clock`), and without one every entry is

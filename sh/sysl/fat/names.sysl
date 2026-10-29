@@ -1,4 +1,5 @@
 module sh.sysl.fat
+@no_alloc
 
 import sysl.encode_utf8
 import sysl.text.Ascii

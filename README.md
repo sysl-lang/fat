@@ -10,7 +10,7 @@ authors or trademark holders.*
 
 ```hocon
 dependencies {
-  fat { git = "github.com/sysl-lang/fat", version = "0.4.0" }
+  fat { git = "github.com/sysl-lang/fat", version = "0.4.1" }
 }
 ```
 

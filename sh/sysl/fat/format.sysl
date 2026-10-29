@@ -1,4 +1,5 @@
 module sh.sysl.fat
+@no_alloc
 
 import sysl.encoding.put_u32_le
 import sysl.slices.fill
