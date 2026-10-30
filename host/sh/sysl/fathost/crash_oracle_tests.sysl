@@ -277,7 +277,7 @@ private cut_run(op: Op, base: string, image: string, left: Option[u32], bulk: bo
     if left.is_none()
         done.unwrap()
         if bulk && dev.spans == 0 then panic(f"$op wrote no run of sectors through the device's own write_many")
-    dev.cut.image.close()
+    dev.cut.image.store().close()
     dev.cut.writes
 
 private check_op(dir: string, op: Op, bulk: bool)
@@ -286,13 +286,13 @@ private check_op(dir: string, op: Op, bulk: bool)
     val fat32 = op == Op.AppendFat32
     var dev = create_image(base, if fat32 then 70000 else 8500).unwrap()
     format(&dev, Some(if fat32 then FatType.Fat32 else FatType.Fat16)).unwrap()
-    dev.close()
+    dev.store().close()
     var setup = CutImage(open_image(base).unwrap(), 0, 0, false)
     val scratch: Buf[u8] = buf_filled(512, 0)
     var v = mount(&setup, scratch.view()).unwrap()
     set_up(op, &v)
     v.flush().unwrap()
-    setup.image.close()
+    setup.image.store().close()
     require_clean(base, f"$op: the volume before it")
 
     val total = cut_run(op, base, image, None, bulk)
@@ -320,7 +320,7 @@ private check_op(dir: string, op: Op, bulk: bool)
         var both = false
         for alternative in both_names(op).view()
             if holds(&back, alternative.view()) == "" then both = true
-        img.close()
+        img.store().close()
         if !old && !new && !both then panic(f"$op cut after $n of $total writes: repaired to neither the volume before ($old_miss) nor the one after ($new_miss):\n$repair")
         if n == 0 && !old then panic(f"$op: cut before any write, the volume changed")
         if n == total && !new then panic(f"$op: not cut at all, the operation did not happen")

@@ -12,7 +12,7 @@ private geometry_of(image: string, sector_size: usize = 512) -> Geometry
     var dev = open_image(image, sector_size).unwrap()
     val scratch: Buf[u8] = buf_filled(sector_size, 0)
     val g = read_geometry(&dev, scratch.view()).unwrap()
-    dev.close()
+    dev.store().close()
     g
 
 private made(args: []string) -> string = run_mkfs(args, 0x5EED_0001) match
@@ -63,7 +63,7 @@ formats_existing_image()
     val dir = make_temp_dir("mkfs-fat-").unwrap()
     val image = f"$dir/e.img"
     var blank = create_image(image, 40960).unwrap()
-    blank.close()
+    blank.store().close()
     made([image])
     val g = geometry_of(image)
     assert_eq(g.total_sectors, 40960)

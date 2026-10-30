@@ -1,0 +1,98 @@
+module sh.sysl.fat
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.io.{MemoryError, Positioned, ReadAt, SliceAt, WriteAt, slice_at}
+
+// A store in memory that fails on demand: its extent, every read or write, its sync, or that answers a
+// read with one byte fewer than asked.
+private struct Flaky
+    inner: SliceAt
+    fail_extent: bool
+    failing: bool
+    short: bool
+    fail_sync: bool
+
+private flaky(storage: []u8) -> Flaky = Flaky(inner = slice_at(storage), fail_extent = false, failing = false, short = false, fail_sync = false)
+
+impl Positioned for Flaky
+    type Error = MemoryError
+
+    extent(*self) -> Result[u64, MemoryError]
+        if self.fail_extent then return Err(MemoryError.NoRoom)
+        self.inner.extent()
+
+impl ReadAt for Flaky
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, MemoryError]
+        if self.failing then return Err(MemoryError.NoRoom)
+        if self.short && into.len > 0 then return self.inner.read_at(offset, into[..<into.len - 1])
+        self.inner.read_at(offset, into)
+
+impl WriteAt for Flaky
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, MemoryError]
+        if self.failing then return Err(MemoryError.NoRoom)
+        self.inner.write_at(offset, bytes)
+
+    override sync(*self) -> Result[unit, MemoryError] = if self.fail_sync then Err(MemoryError.NoRoom) else Ok(())
+
+@test("StoreDevice: sectors of a positioned store, read and written in place, refused past its end or at a wrong length")
+store_device_sectors()
+    var storage: [1300]u8 = [0; 1300]
+    var dev = store_device(slice_at(storage[..])).unwrap()
+    assert(dev.sectors() == 2 && dev.sector_size() == 512)
+    val ones: [512]u8 = [1; 512]
+    dev.write(1, ones[..]).unwrap()
+    for i in 0..<1300 do assert(storage[i] == (if i >= 512 && i < 1024 then 1 else 0))
+    storage[0] = 9
+    var out: [512]u8 = [0; 512]
+    dev.read(0, out[..]).unwrap()
+    assert(out[0] == 9)
+    assert(dev.read(2, out[..]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.write(2, ones[..]).err() == Some(DeviceError.OutOfRange))
+    assert(dev.read(0, out[..<511]).err() == Some(DeviceError.BadLength))
+    assert(dev.write(0, ones[..<100]).err() == Some(DeviceError.BadLength))
+    dev.flush().unwrap()
+    var big = store_device(slice_at(storage[..]), 1024).unwrap()
+    assert(big.sectors() == 1 && big.sector_size() == 1024)
+    var none = store_device(slice_at(storage[..]), 0).unwrap()
+    assert(none.sectors() == 0)
+
+@test("StoreDevice: a volume formatted, written and read back over a store")
+store_device_volume()
+    var storage: Buf[u8] = buf_filled(16 * 1024 * 1024, 0)
+    var dev = store_device(slice_at(storage.view())).unwrap()
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var v = mount(&dev, cache[..]).unwrap()
+    var f = v.create("STORE.BIN").unwrap()
+    var data: Buf[u8] = buf()
+    for i in 0..<5000 do data.push(u8((i * 31) % 251))
+    assert(v.write(&f, data.view()).unwrap() == data.len())
+    v.flush().unwrap()
+    var g = v.open("STORE.BIN").unwrap()
+    var out: Buf[u8] = buf_filled(5000, 0)
+    assert(v.read(&g, out.view()).unwrap() == 5000)
+    for i in 0..<5000 do assert(out[i] == data[i])
+
+@test("StoreDevice: the store's failures — its extent, a read, a short read, a write, a sync — reach the volume as Io(0)")
+store_device_failures()
+    var storage: [2048]u8 = [0; 2048]
+    var bad = flaky(storage[..])
+    bad.fail_extent = true
+    assert(store_device(bad).err() == Some(MemoryError.NoRoom))
+    var dev = store_device(flaky(storage[..])).unwrap()
+    var out: [512]u8 = [0; 512]
+    val ones: [512]u8 = [1; 512]
+    dev.store().failing = true
+    assert(dev.read(0, out[..]).err() == Some(DeviceError.Io(0)))
+    assert(dev.write(0, ones[..]).err() == Some(DeviceError.Io(0)))
+    dev.store().failing = false
+    dev.store().short = true
+    assert(dev.read(1, out[..]).err() == Some(DeviceError.Io(0)))
+    dev.store().short = false
+    dev.read(1, out[..]).unwrap()
+    dev.store().fail_sync = true
+    assert(dev.flush().err() == Some(DeviceError.Io(0)))
+    var cache: [512]u8 = [0; 512]
+    dev.store().failing = true
+    assert(mount(&dev, cache[..]).err() == Some(VolumeError.Device(DeviceError.Io(0))))

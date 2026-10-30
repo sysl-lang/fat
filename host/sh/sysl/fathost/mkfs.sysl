@@ -132,7 +132,7 @@ run_mkfs(args: []string, volume_id: u32) -> Result[string, string]
             Err(_) -> return Err(f"mkfs.fat: cannot open $image")
 
     val made = format(&dev, kind, cluster_bytes, label, id)
-    dev.close()
+    dev.store().close()
     made match
         Ok(g) -> Ok(summary(image, g))
         Err(e) -> Err(f"mkfs.fat: ${format_message(e)}")

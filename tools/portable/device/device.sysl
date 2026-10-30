@@ -1,7 +1,7 @@
 module device
 
 import sh.sysl.fat.{BlockDevice, DeviceError}
-import sysl.slices.copy
+import sysl.slices.{copy, fill}
 
 // A device with no operating system behind it: a few sectors of static memory, standing in for an SD
 // card or a virtio disk. It reports the size of a volume large enough for FAT16 and answers reads past its
@@ -21,11 +21,7 @@ impl BlockDevice for StaticDevice
     read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
         if s >= self.count then return Err(DeviceError.OutOfRange)
         val at = usize(s) * 512
-        if at + 512 <= STORED
-            copy(out, storage[at..<at + 512])
-        else
-            for i in 0..<out.len
-                out[i] = 0
+        if at + 512 <= STORED then copy(out, storage[at..<at + 512]) else fill(out, 0)
         Ok(())
 
     write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]

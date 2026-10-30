@@ -1,6 +1,7 @@
 module sh.sysl.fat
 @no_alloc
 
+import sysl.io.{ReadAt, WriteAt, read_exact_at, write_all_at}
 import sysl.slices.copy
 
 // The block device everything in the package is written against: whole sectors, read and written by
@@ -101,3 +102,41 @@ impl BlockDevice for RamDevice
         Ok(())
 
     flush(*self) -> Result[unit, DeviceError] = Ok(())
+
+// A device over any positioned store, `sysl.io`'s `ReadAt` and `WriteAt`: an image file (`sysl.fs.File`),
+// a slice (`slice_at`), a region of flash. Sector `s` is bytes `s * size ..< (s + 1) * size` of the
+// store, and `flush` is the store's `sync`. The store's own error is its own type, not a code, so a
+// failure, a short read included, reaches the volume as `DeviceError.Io(0)`.
+struct StoreDevice[S: ReadAt + WriteAt]
+    private held: S
+    private size: usize
+    private count: u64
+
+    // The store, for what the device does not do with it: closing a file, say.
+    store(*self) -> *S = &self.held
+
+// A device over `store`, in sectors of `sector_size` bytes: as many whole sectors as its extent holds,
+// any bytes left over unused. A `sector_size` of 0 makes a device with no sectors.
+store_device[S: ReadAt + WriteAt](store: S, sector_size: usize = 512) -> Result[StoreDevice[S], S::Error]
+    var held = store
+    val extent = held.extent()?
+    Ok(StoreDevice(held = held, size = sector_size, count = if sector_size == 0 then 0 else extent / u64(sector_size)))
+
+impl[S: ReadAt + WriteAt] BlockDevice for StoreDevice[S]
+    sector_size(self) -> usize = self.size
+    sectors(self) -> u64 = self.count
+
+    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
+        if out.len != self.size then return Err(DeviceError.BadLength)
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        read_exact_at(&self.held, s * u64(self.size), out) match
+            Ok(got) -> if got.len == out.len then Ok(()) else Err(DeviceError.Io(0))
+            Err(_) -> Err(DeviceError.Io(0))
+
+    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != self.size then return Err(DeviceError.BadLength)
+        if s >= self.count then return Err(DeviceError.OutOfRange)
+        if write_all_at(&self.held, s * u64(self.size), data).is_err() then return Err(DeviceError.Io(0))
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError] = if self.held.sync().is_ok() then Ok(()) else Err(DeviceError.Io(0))

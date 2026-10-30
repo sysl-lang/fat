@@ -46,14 +46,20 @@ impl BulkDevice
         self.starts.push(sector)
         self.lens.push(len)
 
-    // Whether every span recorded lies inside one cluster of `g`.
-    within_clusters(self, g: Geometry) -> bool
-        val first = u64(g.first_data_sector)
-        val per = u64(g.sectors_per_cluster)
-        for i in 0..<self.starts.len()
-            val last = self.starts[i] + u64(self.lens[i] / 512) - 1
-            if (self.starts[i] - first) / per != (last - first) / per then return false
-        true
+// Whether every span the volume's device recorded from the `from`th on runs over clusters that follow
+// one another in their chain as they do on the disk.
+private follows_chains(v: *Volume[BulkDevice], from: usize) -> bool
+    val g = v.geometry
+    val first = u64(g.first_data_sector)
+    val per = u64(g.sectors_per_cluster)
+    for i in from..<v.dev.starts.len()
+        val start = v.dev.starts[i]
+        val last = start + u64(v.dev.lens[i] / 512) - 1
+        var c = u32((start - first) / per) + 2
+        while c < u32((last - first) / per) + 2
+            if v.next_cluster(c).unwrap() != Some(c + 1) then return false
+            c += 1
+    true
 
 // A device with no bulk command whose `write` fails once `left` sectors are written: the default
 // `write_many` loop is cut part way.
@@ -114,24 +120,24 @@ default_cut()
     dev.read(3, out[..]).unwrap()
     for b in out do assert(b == 0)
 
-@test("FAT bulk I/O: aligned runs use bulk hooks within clusters and preserve partial/dirty cached sectors")
+@test("FAT bulk I/O: a file written fresh is one run of sectors across its clusters, written and read, and a partial sector still goes through the buffer")
 volume_bulk()
     var dev = bulk_device(32768)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var volume = mount(&dev, cache[..]).unwrap()
     val cluster = usize(volume.geometry.cluster_bytes())
-    assert(cluster > 512)
+    assert(cluster > 512 && cluster < 8192)
     var file = volume.create("BULK.BIN").unwrap()
     var input: [8192]u8 = [0; 8192]
     for i in 0..<8192 do input[i] = u8.wrap(i * 13)
     assert(volume.write(&file, input[..]).unwrap() == input.len)
-    assert(dev.writes > 0 && dev.largest == cluster)
+    assert(dev.writes == 1 && dev.largest == input.len)
     file.seek(0)
     var out: [8192]u8 = [0; 8192]
     assert(volume.read(&file, out[..]).unwrap() == out.len)
     for i in 0..<8192 do assert(out[i] == input[i])
-    assert(dev.reads > 0)
+    assert(dev.reads == 1)
     file.seek(17)
     val patch: [3]u8 = [71, 72, 73]
     volume.write(&file, patch[..]).unwrap()
@@ -139,9 +145,9 @@ volume_bulk()
     volume.read(&file, out[..]).unwrap()
     for i in 0..<8192 do assert(out[i] == (if i >= 17 && i < 20 then patch[i - 17] else input[i]))
     volume.flush().unwrap()
-    assert(dev.within_clusters(volume.geometry))
+    assert(follows_chains(&volume, 0))
 
-@test("FAT bulk I/O: a run starting part way into a cluster stops at the cluster's end, writing and reading")
+@test("FAT bulk I/O: a run starting part way into a cluster runs on through the clusters after it, writing and reading")
 volume_bulk_unaligned()
     var dev = bulk_device(32768)
     format(&dev, Some(FatType.Fat16)).unwrap()
@@ -159,8 +165,73 @@ volume_bulk_unaligned()
     for _ in 0..<body.len() do out.push(0)
     assert(volume.read(&file, out.view()).unwrap() == body.len())
     for i in 0..<body.len() do assert(out[i] == body[i])
-    assert(dev.largest == usize(cluster))
-    assert(dev.within_clusters(volume.geometry))
+    assert(dev.largest == body.len())
+    assert(follows_chains(&volume, 0))
+
+@test("FAT bulk I/O: a run stops where the next cluster of the chain is not the next on the disk")
+volume_bulk_fragmented()
+    var dev = bulk_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    val cluster = usize(volume.geometry.cluster_bytes())
+    // Two files written a cluster at a time in turn: each chain takes every other cluster.
+    var a = volume.create("A.BIN").unwrap()
+    var b = volume.create("B.BIN").unwrap()
+    val data = pattern(4 * cluster, 8)
+    val other = pattern(4 * cluster, 9)
+    for k in 0..<4
+        volume.write(&a, data.view()[k * cluster..<(k + 1) * cluster]).unwrap()
+        volume.write(&b, other.view()[k * cluster..<(k + 1) * cluster]).unwrap()
+    val from = dev.starts.len()
+    a.seek(0)
+    var out: Buf[u8] = buf()
+    for _ in 0..<data.len() do out.push(0)
+    assert(volume.read(&a, out.view()).unwrap() == data.len())
+    for i in 0..<data.len() do assert(out[i] == data[i])
+    assert(dev.starts.len() - from == 4)
+    for i in from..<dev.starts.len() do assert(dev.lens[i] == cluster)
+    assert(follows_chains(&volume, 0))
+    // A write over the whole of a fragmented file is cut at the same places.
+    val again = dev.starts.len()
+    a.seek(0)
+    assert(volume.write(&a, other.view()).unwrap() == other.len())
+    assert(dev.starts.len() - again == 4)
+    assert(follows_chains(&volume, 0))
+
+@test("FAT bulk I/O: a read stops its run short of a sector the buffer holds unwritten, and reads that sector from the buffer")
+volume_bulk_dirty_clip()
+    var dev = bulk_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    val cluster = usize(volume.geometry.cluster_bytes())
+    assert(cluster >= 2048)
+    var file = volume.create("DIRTY.BIN").unwrap()
+    val data = pattern(8192, 10)
+    volume.write(&file, data.view()).unwrap()
+    volume.flush().unwrap()
+    // Three bytes into the third sector, in the buffer and not yet on the device. `write` itself ends
+    // by loading the file's entry, so the state is made here directly.
+    val first = u64(volume.geometry.cluster_start(file.first_cluster))
+    val dirty = first + 2
+    volume.load(dirty).unwrap()
+    val patch: [3]u8 = [1, 2, 3]
+    for k in 0..<3 do volume.sector[5 + k] = patch[k]
+    volume.dirty = true
+    val from = dev.starts.len()
+    // One cluster's worth, so no FAT sector is loaded, which would write the buffer back first.
+    file.seek(0)
+    var out: Buf[u8] = buf()
+    for _ in 0..<cluster do out.push(0)
+    assert(volume.read(&file, out.view()).unwrap() == cluster)
+    for i in 0..<cluster do assert(out[i] == (if i >= 2 * 512 + 5 && i < 2 * 512 + 8 then patch[i - 2 * 512 - 5] else data[i]))
+    // A run of the two sectors before it, the sector itself from the buffer, still unwritten, and a run
+    // of the rest of the cluster after it.
+    assert(volume.dirty && volume.loaded == dirty)
+    assert(dev.starts.len() - from == 2)
+    assert(dev.starts[from] == first && dev.lens[from] == 2 * 512)
+    assert(dev.starts[from + 1] == dirty + 1 && dev.lens[from + 1] == cluster - 3 * 512)
 
 @test("FAT bulk I/O: a bulk write cut part way fails the write, and the file reads as the device holds it after")
 volume_bulk_cut()
@@ -200,20 +271,29 @@ volume_default_cut()
     dev.left = 3
     assert(volume.write(&file, pattern(8192, 5).view()).err() == Some(VolumeError.Device(DeviceError.Io(7))))
 
-@test("FAT bulk I/O: a device failing after whole clusters landed answers the short count, and the next write the error")
+@test("FAT bulk I/O: a device failing after whole runs landed answers the short count, and the next write the error")
 volume_cut_short()
     var dev = CutWrites(ram(32768), 0xFFFF_FFFF)
     format(&dev, Some(FatType.Fat16)).unwrap()
     var cache: [512]u8 = [0; 512]
     var volume = mount(&dev, cache[..]).unwrap()
-    var file = volume.create("SHORT.BIN").unwrap()
-    volume.flush().unwrap()
     val cluster = usize(volume.geometry.cluster_bytes())
+    val per = cluster / 512
+    // Two files written a cluster at a time in turn, so each chain is runs of one cluster.
+    var file = volume.create("SHORT.BIN").unwrap()
+    var other = volume.create("OTHER.BIN").unwrap()
+    val old = pattern(4 * cluster, 5)
+    for k in 0..<4
+        volume.write(&file, old.view()[k * cluster..<(k + 1) * cluster]).unwrap()
+        volume.write(&other, old.view()[k * cluster..<(k + 1) * cluster]).unwrap()
+    volume.flush().unwrap()
+    // Room for two runs and part of a third: the write answers the two.
     val data = pattern(4 * cluster, 6)
-    dev.left = 8
+    dev.left = u32(2 * per + 1)
+    file.seek(0)
     val n = volume.write(&file, data.view()).unwrap()
-    assert(n > 0 && n < data.len() && n % cluster == 0)
-    assert(file.size == u32(n) && file.position() == u32(n))
+    assert(n == 2 * cluster)
+    assert(file.size == u32(4 * cluster) && file.position() == u32(n))
     dev.left = 0
     assert(volume.write(&file, data.view()[n..]).err() == Some(VolumeError.Device(DeviceError.Io(7))))
     dev.left = 0xFFFF_FFFF
@@ -222,6 +302,22 @@ volume_cut_short()
     for _ in 0..<n do out.push(0)
     assert(volume.read(&file, out.view()).unwrap() == n)
     for i in 0..<n do assert(out[i] == data[i])
+
+@test("FAT bulk I/O: a write that fills the volume part way through a run answers what landed, as one run")
+volume_full_in_run()
+    var dev = bulk_device(32768)
+    format(&dev, Some(FatType.Fat16)).unwrap()
+    var cache: [512]u8 = [0; 512]
+    var volume = mount(&dev, cache[..]).unwrap()
+    val g = volume.geometry
+    val room = usize(g.clusters) * usize(g.cluster_bytes())
+    var file = volume.create("ALL.BIN").unwrap()
+    val from = dev.starts.len()
+    val data = pattern(room + 4096, 11)
+    assert(volume.write(&file, data.view()).unwrap() == room)
+    assert(dev.starts.len() - from == 1 && dev.lens[from] == room)
+    assert(volume.write(&file, data.view()[room..]).err() == Some(VolumeError.NoSpace))
+    assert(follows_chains(&volume, 0))
 
 @test("RamDevice: reads and writes the caller's storage in place, whole sectors of it, and refuses past its end")
 ram_device_storage()

@@ -99,7 +99,7 @@ private write_tree(image: string, sector_size: usize = 512)
     for k in 0usize..<40
         put(&v, f"late/${late_name(k)}", bytes(k, k + 100).view())
     v.flush().unwrap()
-    dev.close()
+    dev.store().close()
 
 // What each file should hold once `write_tree` is done: its path and bytes.
 private expected() -> Buf[(string, Buf[u8])]
@@ -150,7 +150,7 @@ written_fat16_is_clean()
     val image = f"$dir/fat16.img"
     var dev = create_image(image, 204800).unwrap()
     format(&dev, Some(FatType.Fat16), label = "WRITTEN").unwrap()
-    dev.close()
+    dev.store().close()
     write_tree(image)
     check_tree(dir, image)
     remove_dir_all(dir).unwrap()
@@ -162,7 +162,7 @@ written_fat32_is_clean()
     val image = f"$dir/fat32.img"
     var dev = create_image(image, 532481).unwrap()
     format(&dev, Some(FatType.Fat32)).unwrap()
-    dev.close()
+    dev.store().close()
     write_tree(image)
     check_tree(dir, image)
     remove_dir_all(dir).unwrap()
@@ -182,7 +182,7 @@ written_after_wrapping()
         if v.write(&filler, block.view()).is_err() then break
     v.remove("filler").unwrap()
     v.flush().unwrap()
-    dev.close()
+    dev.store().close()
     write_tree(image)
     check_tree(dir, image)
     remove_dir_all(dir).unwrap()

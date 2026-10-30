@@ -433,12 +433,24 @@ struct Volume[D: BlockDevice]
             if u64(n) > u64(out.len - done) then n = u32(out.len - done)
             if n > f.size - f.at then n = f.size - f.at
             if offset == 0
-                var span = cluster_bytes - within
-                if u64(span) > u64(out.len - done) then span = u32(out.len - done)
-                if span > f.size - f.at then span = f.size - f.at
-                span = (span / bps) * bps
-                // Never bypass a dirty cached sector inside the proposed run.
-                if span >= bps && !(self.dirty && self.loaded >= sector && self.loaded < sector + u64(span / bps)) then n = span
+                // A run of whole sectors, on through every cluster that follows on the disk as it
+                // follows in the chain, and up to the wanted end.
+                val wanted = u64(if u64(out.len - done) < u64(f.size - f.at) then u32(out.len - done) else f.size - f.at)
+                var span = u64(cluster_bytes - within)
+                var last = f.cluster
+                while span < wanted
+                    val next = self.next_cluster(last)? match
+                        Some(c) -> c
+                        None -> break
+                    if next != last + 1 then break
+                    last = next
+                    span += u64(cluster_bytes)
+                if span > wanted then span = wanted
+                // Never bypass a dirty cached sector: the run stops short of it.
+                if self.dirty && self.loaded >= sector && self.loaded < sector + span / u64(bps)
+                    span = (self.loaded - sector) * u64(bps)
+                span = span / u64(bps) * u64(bps)
+                if span >= u64(bps) then n = u32(span)
             val into = out[done..<done + usize(n)]
             // A sector the buffer holds may have a write in it the device has not seen.
             if n >= bps && (n > bps || self.loaded != sector)
@@ -446,6 +458,10 @@ struct Volume[D: BlockDevice]
             else
                 self.load(sector)?
                 copy(into, self.sector[usize(offset)..<usize(offset + n)])
+            // The run may have ended in a later cluster of the chain, which follows this one on the disk.
+            val reached = (f.at + n - 1) / cluster_bytes
+            f.cluster += reached - f.cluster_index
+            f.cluster_index = reached
             f.at += n
             done += usize(n)
         Ok(done)

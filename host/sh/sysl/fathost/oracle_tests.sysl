@@ -56,7 +56,7 @@ private check_with_both(dir: string, sectors: u64, kind: Option[FatType] = None,
     val g = format(&dev, kind, label = "ORACLE", volume_id = 0xC0FF_EE00) match
         Ok(g) -> g
         Err(e) -> panic(f"format refused $sectors sectors: $e")
-    dev.close()
+    dev.store().close()
 
     val bsd = capture(FSCK_MSDOS, ["-n", image], stderr = true).unwrap()
     val bsd_text = bsd.text + bsd.err.unwrap_or("")
@@ -113,7 +113,7 @@ private read_theirs(image: string, kind: FatType, cluster_bytes: u32)
     var dev = open_image(image).unwrap()
     val scratch: Buf[u8] = buf_filled(512, 0)
     val g = read_geometry(&dev, scratch.view()).unwrap()
-    dev.close()
+    dev.store().close()
     assert_eq(g.fat_type, kind)
     assert_eq(g.cluster_bytes(), cluster_bytes)
     val linux = capture(FSCK_FAT, ["-n", "-v", image], stderr = true).unwrap()
@@ -135,7 +135,7 @@ reads_other_formatters()
     for fat32 in [false, true]
         val c = f"$dir/mformat-$fat32.img"
         var blank = create_image(c, 204800).unwrap()
-        blank.close()
+        blank.store().close()
         val args: []const string = if fat32 then ["-i", c, "-F", "-c", "8", "::"] else ["-i", c, "-c", "8", "::"]
         val made = capture(MFORMAT, args, stderr = true).unwrap()
         val said = made.err.unwrap_or("")

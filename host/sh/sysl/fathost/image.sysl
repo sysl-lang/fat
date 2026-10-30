@@ -1,55 +1,21 @@
 module sh.sysl.fathost
 @requires(os)
 
-import sh.sysl.fat.{BlockDevice, DeviceError}
+import sh.sysl.fat.{DeviceError, StoreDevice, store_device}
 import sysl.fs
-import sysl.io.{Reader, WriteAt}
 
-// A block device over an image file: sector `s` is bytes `s * size ..< (s + 1) * size` of the file.
-// Writes go to the operating system as they are made; `flush` asks it to make them durable.
-struct ImageDevice
-    private file: fs.File
-    private size: usize
-    private count: u64
-
-    // Hand back the file; further use of the device fails.
-    close(*self) -> bool = self.file.close().is_ok()
-
-impl BlockDevice for ImageDevice
-    sector_size(self) -> usize = self.size
-    sectors(self) -> u64 = self.count
-
-    read(*self, s: u64, out: []u8) -> Result[unit, DeviceError]
-        if out.len != self.size then return Err(DeviceError.BadLength)
-        if s >= self.count then return Err(DeviceError.OutOfRange)
-        if self.file.seek(long(s) * long(self.size)).is_err() then return Err(DeviceError.Io(0))
-        val got = self.file.read(out)
-        if self.file.failed() || got.len != self.size then return Err(DeviceError.Io(0))
-        Ok(())
-
-    write(*self, s: u64, data: []const u8) -> Result[unit, DeviceError]
-        if data.len != self.size then return Err(DeviceError.BadLength)
-        if s >= self.count then return Err(DeviceError.OutOfRange)
-        if self.file.seek(long(s) * long(self.size)).is_err() then return Err(DeviceError.Io(0))
-        self.file.write(data)
-        if self.file.failed() then return Err(DeviceError.Io(0))
-        Ok(())
-
-    flush(*self) -> Result[unit, DeviceError]
-        // `sync`, not `flush`: a flush hands the bytes to the operating system, and only an fsync asks
-        // it to keep them.
-        if self.file.sync().is_err() || self.file.failed() then return Err(DeviceError.Io(0))
-        Ok(())
+// A block device over an image file: the package's device over any positioned store, over a file.
+// Writes go to the operating system as they are made, and `flush` is the file's `sync`, an fsync: a
+// flush alone would hand the bytes over without asking the system to keep them. `dev.store().close()`
+// hands the file back.
+type ImageDevice = StoreDevice[fs.File]
 
 // Open an existing image of `sector_size`-byte sectors; a trailing part sector is not used.
 open_image(path: string, sector_size: usize = 512) -> Result[ImageDevice, DeviceError]
-    var f = fs.open_update(path) match
+    val f = fs.open_update(path) match
         Ok(f) -> f
         Err(_) -> return Err(DeviceError.Io(0))
-    val size = f.size() match
-        Ok(n) -> n
-        Err(_) -> return Err(DeviceError.Io(0))
-    Ok(ImageDevice(f, sector_size, u64(size) / u64(sector_size)))
+    image_of(f, sector_size)
 
 // Make a new image of `sectors` sectors, replacing any file there. It is sparse where the host's
 // filesystem allows: only the sectors written take space.
@@ -58,4 +24,8 @@ create_image(path: string, sectors: u64, sector_size: usize = 512) -> Result[Ima
         Ok(f) -> f
         Err(_) -> return Err(DeviceError.Io(0))
     if f.truncate(long(sectors) * long(sector_size)).is_err() then return Err(DeviceError.Io(0))
-    Ok(ImageDevice(f, sector_size, sectors))
+    image_of(f, sector_size)
+
+private image_of(f: fs.File, sector_size: usize) -> Result[ImageDevice, DeviceError] = store_device(f, sector_size) match
+    Ok(d) -> Ok(d)
+    Err(_) -> Err(DeviceError.Io(0))

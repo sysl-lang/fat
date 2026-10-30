@@ -10,7 +10,7 @@ authors or trademark holders.*
 
 ```hocon
 dependencies {
-  fat { git = "github.com/sysl-lang/fat", version = "0.4.1" }
+  fat { git = "github.com/sysl-lang/fat", version = "0.5.0" }
 }
 ```
 
@@ -97,10 +97,22 @@ trait BlockDevice
     flush(*self) -> Result[unit, DeviceError]
 ```
 
-A file's data goes to and from the device in runs of whole sectors, up to a cluster at a time, through
-`read_many` and `write_many`; a device with a multi-sector command (an SD card's CMD18 and CMD25)
-overrides them, and the volume's buffer is written back before every run, so the device still sees the
-writes in order. A part of a sector goes through the volume's one sector as before.
+A file's data goes to and from the device in runs of whole sectors through `read_many` and
+`write_many`, each run going on through every cluster that follows the one before on the disk, as a
+file written to a fresh volume does; a device with a multi-sector command (an SD card's CMD18 and
+CMD25) overrides them. The volume's buffer is written back before every write, so the device still
+sees the writes in order, and a read stops its run short of a sector the buffer holds unwritten. A
+part of a sector goes through the volume's one sector.
+
+Any positioned store — `sysl.io`'s `ReadAt` and `WriteAt` — is a device through `StoreDevice`: an image
+file (`sysl.fs.File`, which is how the host package's `ImageDevice` is made), a slice (`slice_at`), a
+region of flash.
+
+```sysl
+import sh.sysl.fat.store_device
+
+var dev = store_device(fs.open_update("card.img")?)?     // sectors of 512 bytes; flush is the file's sync
+```
 
 An open file is also a positioned store — `sysl.io`'s `ReadAt` and `WriteAt` — so a library written
 against those traits takes it with no adapter:
