@@ -133,13 +133,13 @@ private check(image: string, sector_size: usize = 512)
     for k in 0usize..<60
         var f = v.open(f"many/${many_name(k)}").unwrap()
         if !same(read_all(&v, &f).view(), content(k * 37, k).view()) then panic(f"many/$k differs")
-    dev.store().close()
+    dev.store().close().unwrap()
 
 private ours(dir: string, name: string, sectors: u64, kind: Option[FatType], sector_size: usize = 512) -> string
     val image = f"$dir/$name.img"
     var dev = create_image(image, sectors, sector_size).unwrap()
     format(&dev, kind, label = "READ").unwrap()
-    dev.store().close()
+    dev.store().close().unwrap()
     image
 
 @test("files and directories mtools writes into our FAT16 volume read back byte for byte, long names included")
@@ -166,7 +166,7 @@ mtools_own_fat32()
     val dir = make_temp_dir("fat-read-").unwrap()
     val image = f"$dir/mformat.img"
     var blank = create_image(image, 204800).unwrap()
-    blank.store().close()
+    blank.store().close().unwrap()
     mtool(MFORMAT_TOOL, ["-i", image, "-F", "-c", "1", "::"])
     fill(dir, image)
     check(image)
